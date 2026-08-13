@@ -110,16 +110,23 @@ def test_lerp3_blends_between_two_colours():
 
 # ------------------------------------------------------------------ the count
 
-def test_count_rises_one_per_second_through_the_inhale():
+def test_count_starts_at_zero_and_turns_over_each_whole_second():
     seen = [breathe.phase_count(4.0, 6.0, "in", 4.0 - t)
-            for t in (0.0, 0.9, 1.1, 2.5, 3.99)]
-    assert seen == [1, 1, 2, 3, 4]
+            for t in (0.0, 0.9, 1.0, 1.1, 2.5, 3.99)]
+    assert seen == [0, 0, 1, 1, 2, 3]
+
+
+def test_count_shows_zero_for_the_whole_first_second():
+    """The first second is watched ticking away, not skipped."""
+    for t in (0.0, 0.25, 0.5, 0.75, 0.999):
+        assert breathe.phase_count(4.0, 6.0, "in", 4.0 - t) == 0
+    assert breathe.phase_count(4.0, 6.0, "out", 6.0 - 0.999) == 0
 
 
 def test_count_never_exceeds_the_phase_length():
     for t in range(0, 600):
         left = 6.0 - t / 100.0
-        assert 1 <= breathe.phase_count(4.0, 6.0, "out", left) <= 6
+        assert 0 <= breathe.phase_count(4.0, 6.0, "out", left) <= 6
 
 
 def test_hold_keeps_the_last_number_of_the_phase_it_follows():
@@ -129,7 +136,17 @@ def test_hold_keeps_the_last_number_of_the_phase_it_follows():
 
 def test_count_tops_out_at_the_ceiling_for_fractional_phases():
     assert breathe.phase_count(5.5, 6.0, "hold-in", 0.1) == 6
-    assert breathe.phase_count(5.5, 6.0, "in", 0.01) == 6
+    assert breathe.phase_count(5.5, 6.0, "in", 0.01) == 5
+
+
+def test_count_walks_the_whole_phase_without_skipping_a_number():
+    seen = []
+    for i in range(460):                       # 11.5s: a full 11s cycle + a bit
+        _, phase, _, left = breathe.phase_at(i * 0.025, 4.0, 6.0, 0.5)
+        n = breathe.phase_count(4.0, 6.0, phase, left)
+        if not seen or seen[-1] != n:
+            seen.append(n)
+    assert seen == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 5, 6, 0]
 
 
 # ------------------------------------------------------------------ the sound
@@ -210,6 +227,54 @@ def test_the_orb_reddens_as_it_fills(glass):
     full = glass.render("hold-in", 1.0, 0.5, 4.0).getpixel((cx, cy))
     assert full[0] > empty[0]                    # more red
     assert full[1] < empty[1] and full[2] < empty[2]   # less green, less blue
+
+
+def test_the_orb_never_freezes_late_in_the_inhale(glass):
+    """The regression this test file exists for.
+
+    ease() flattens hard at the turnaround, so over the last second of a 4s
+    inhale the orb grows by well under a pixel per frame. Rounding to whole
+    pixels there held it still for up to 14 frames and then jumped it one
+    pixel — the stutter. Every frame must move, and only forwards.
+    """
+    masses = []
+    for i in range(60):
+        t = 3.0 + i / 60.0
+        _, phase, progress, _ = breathe.phase_at(t, 4.0, 6.0, 0.5)
+        dd = breathe.orb_radius(breathe.fullness_at(phase, progress)) * 2.0
+        masses.append(sum(glass._core_tile(dd).tobytes()))
+    assert len(set(masses)) == 60, "the orb froze on a repeated size"
+    assert all(b > a for a, b in zip(masses, masses[1:])), "the orb went backwards"
+
+
+def test_consecutive_frames_always_differ_through_the_turnaround(glass):
+    """Whole frames, not just the orb: nothing may repeat, hold included."""
+    prev = None
+    for i in range(120):
+        t = 3.0 + i / 60.0                     # last second of in, into hold
+        _, phase, progress, left = breathe.phase_at(t, 4.0, 6.0, 0.5)
+        frame = glass.render(phase, breathe.fullness_at(phase, progress),
+                             left, t)
+        assert frame.tobytes() != prev, "frame %d repeated" % i
+        prev = frame.tobytes()
+
+
+def test_the_orb_grows_smoothly_across_a_whole_integer_crossing(glass):
+    """No sharpness step when the diameter passes a whole pixel."""
+    masses = [sum(glass._core_tile(99.9 + k * 0.02).tobytes()) for k in range(11)]
+    steps = [b - a for a, b in zip(masses, masses[1:])]
+    assert all(s > 0 for s in steps)
+    assert max(steps) < 4 * (sum(steps) / len(steps))
+
+
+def test_sprite_caches_stay_bounded(glass):
+    """Lazily built, but they must fill and then stop growing."""
+    for i in range(240):
+        t = i * 0.05
+        _, phase, progress, left = breathe.phase_at(t, 4.0, 6.0, 0.5)
+        glass.render(phase, breathe.fullness_at(phase, progress), left, t)
+    assert len(glass._core_masters) <= int(breathe.R_MAX * 2) + 4
+    assert len(glass._tabs) <= 8
 
 
 def test_the_halo_drifts_so_two_moments_never_match(glass):

@@ -90,6 +90,8 @@ GLOW_SPAN    = 1.9                     # halo diameter / orb diameter
 TAB_C        = (140, 202)              # count tab centre
 TAB_D        = 34
 SS           = 3                       # supersample for the static layers
+CORE_TILE    = int(R_MAX * 2) + 4      # fixed tile the orb is drawn into
+HALO_SCALE   = 2                       # the halo is soft; render it at 1/2
 FPS          = 60
 
 FONT_FILES = [r"C:\Windows\Fonts\segoeui.ttf",
@@ -158,12 +160,18 @@ def lerp3(a, b, t):
 
 
 def phase_count(inhale, exhale, phase, left):
-    """The rising count inside a phase; a hold keeps the last number."""
+    """Seconds elapsed inside the phase, read like a stopwatch.
+
+    Starts at 0 and turns over on each whole second, so the first second is
+    the one you watch tick away rather than one you have already missed. A
+    hold shows the phase length, which is the number the count was climbing
+    toward: 0,1,2,3 through a 4s inhale, then 4 while it is held.
+    """
     length = inhale if phase in ("in", "hold-in") else exhale
     top = int(math.ceil(length))
     if phase.startswith("hold"):
         return top
-    return max(1, min(top, int(length - left) + 1))
+    return max(0, min(top, int(length - left)))
 
 
 # ============================================================ SOUND
@@ -345,6 +353,7 @@ class Glass:
         self.alive = True
         self.photo = None
         self.start = time.monotonic()
+        self._due = self.start
         self._frame()
 
     # ---------------------------------------------------------- surfaces
@@ -471,8 +480,11 @@ class Glass:
             flat = self.Image.new("RGB", frame.size, (0x01, 0x02, 0x03))
             flat.paste(frame, (0, 0), frame)
             frame = flat
-        self.photo = self.ImageTk.PhotoImage(frame)
-        self.canvas.itemconfigure(self.image_id, image=self.photo)
+        if self.photo is None:                             # build once, then
+            self.photo = self.ImageTk.PhotoImage(frame)     # repaint in place:
+            self.canvas.itemconfigure(self.image_id, image=self.photo)
+        else:
+            self.photo.paste(frame)                         # no realloc, no GC
 
     # ------------------------------------------------------ static layers
 
@@ -513,6 +525,13 @@ class Glass:
         return ImageFont.load_default()
 
     def _build_sprites(self, Image, ImageDraw):
+        # Lazily filled: whole-pixel orb masters, halo alpha LUTs, and one
+        # pre-composed tab per value the count can show. All bounded and all
+        # full within the first breath, so no frame pays to build twice.
+        self._core_masters = {}
+        self._luts = {}
+        self._tabs = {}
+
         N = 512
         big = Image.new("L", (N * 2, N * 2), 0)
         ImageDraw.Draw(big).ellipse((0, 0, N * 2 - 1, N * 2 - 1), fill=255)
@@ -536,12 +555,95 @@ class Glass:
                     px[x, y] = int(255 * (k ** 2.3))
         self.sprite_glow = glow
 
+    # -------------------------------------------------- sub-pixel sprites
+    # ease() flattens hard at each turnaround, so late in the inhale the orb
+    # grows by well under a pixel per frame. Rounding a diameter to whole
+    # pixels there freezes it for a dozen frames and then jumps it one pixel,
+    # which is the stutter you see. So nothing is drawn at an integer size or
+    # an integer offset: a master sprite is resampled into a FIXED tile by an
+    # AFFINE transform, whose scale and translation are floats. The tile is
+    # pasted at a constant integer position, and every sub-pixel change lands
+    # in the anti-aliased edge instead of being rounded away.
+
+    def _core_tile(self, dd):
+        """The orb as an alpha tile, at float diameter dd."""
+        Image = self.Image
+        # Resample from the next whole-pixel master up, so the transform is
+        # always a slight minification and never a blurring enlargement, and
+        # never lands exactly on 1:1 (which would be a visible sharpness step
+        # each time the diameter crosses an integer).
+        n = max(4, int(dd) + 2)
+        master = self._core_masters.get(n)
+        if master is None:
+            master = self.sprite_core.resize((n, n), Image.LANCZOS)
+            self._core_masters[n] = master
+        s = n / dd
+        c = n / 2.0 - s * (CORE_TILE / 2.0)
+        return master.transform((CORE_TILE, CORE_TILE), Image.AFFINE,
+                                (s, 0, c, 0, s, c), resample=Image.BILINEAR)
+
+    def _halo_layer(self, r, gi, e):
+        """All four lobes, composed at half resolution and scaled back up.
+
+        The halo carries no detail - it is a k**2.3 radial falloff - so half
+        the pixels look the same and cost a quarter. Sub-pixel motion survives
+        the shortcut because the size and offset stay floats inside the
+        affine; only the grid they land on is coarser, and it is blurry.
+        """
+        Image = self.Image
+        hw, hh = WIN_W // HALO_SCALE, WIN_H // HALO_SCALE
+        layer = Image.new("RGBA", (hw, hh), (0, 0, 0, 0))
+        n = self.sprite_glow.width
+
+        # Four lobes, each on its own orbit, breathing size and intensity at
+        # unequal rates: the halo is never the same thickness twice round, and
+        # it keeps moving through the hold. Cosmetic only - it never feeds
+        # back into the tick clock.
+        for tint, span, dist, wo, ph, ws, wa, weight in HALO_LOBES:
+            gd = max(2.0, r * 2 * GLOW_SPAN * span *
+                     (1 + 0.22 * math.sin(ws * e + ph)))
+            peak = int(118 * gi * weight *
+                       (0.66 + 0.34 * math.sin(wa * e + ph * 1.7)))
+            if peak <= 0:
+                continue
+            off = r * dist * (1 + 0.20 * math.sin(ws * 0.7 * e + ph * 1.4))
+            ang = ph + wo * e
+            s = n * HALO_SCALE / gd
+            cx = n / 2.0 - s * ((ORB_C[0] + math.cos(ang) * off) / HALO_SCALE)
+            cy = n / 2.0 - s * ((ORB_C[1] + math.sin(ang) * off) / HALO_SCALE)
+            mask = self.sprite_glow.transform(
+                (hw, hh), Image.AFFINE, (s, 0, cx, 0, s, cy),
+                resample=Image.BILINEAR)
+            lut = self._luts.get(peak)
+            if lut is None:
+                lut = self._luts[peak] = bytes(
+                    (a * peak) // 255 for a in range(256))
+            layer.paste(tint + (255,), (0, 0), mask.point(lut))
+        return layer.resize((WIN_W, WIN_H), Image.BILINEAR)
+
+    def _tab_tile(self, count):
+        """Tab and its digit, pre-composed once per value the count can take."""
+        tile = self._tabs.get(count)
+        if tile is not None:
+            return tile
+        tile = self.tab.copy()
+        label = str(count)
+        drw = self.ImageDraw.Draw(tile)
+        try:
+            drw.text(TAB_C, label, font=self.font, fill=TAB_INK + (255,),
+                     anchor="mm")
+        except (TypeError, ValueError):
+            w = drw.textlength(label, font=self.font)
+            drw.text((TAB_C[0] - w / 2, TAB_C[1] - 8), label, font=self.font,
+                     fill=TAB_INK + (255,))
+        self._tabs[count] = tile
+        return tile
+
     # ---------------------------------------------------------- per frame
 
     def render(self, phase, fullness, left, e):
         """Compose one frame. Pure: no window, no clock - so it is testable."""
-        Image = self.Image
-        d = max(2, int(round(orb_radius(fullness) * 2)))
+        dd = orb_radius(fullness) * 2.0
         colour = lerp3(ORB_REST, ORB_FULL, min(1.0, fullness ** 1.15))
         if self.paused:
             colour = lerp3(colour, (176, 158, 146), 0.55)
@@ -551,41 +653,14 @@ class Glass:
 
         gi = 0.0 if self.paused else fullness ** 2.6
         if gi > 0.01:
-            r = d / 2.0
-            # Four lobes, each on its own orbit, breathing size and intensity
-            # at unequal rates: the halo is never the same thickness twice
-            # round, and it keeps moving through the hold. Cosmetic only - it
-            # never feeds back into the tick clock.
-            for tint, span, dist, wo, ph, ws, wa, weight in HALO_LOBES:
-                gd = max(2, int(round(r * 2 * GLOW_SPAN * span *
-                                      (1 + 0.22 * math.sin(ws * e + ph)))))
-                peak = int(118 * gi * weight *
-                           (0.66 + 0.34 * math.sin(wa * e + ph * 1.7)))
-                if peak <= 0:
-                    continue
-                off = r * dist * (1 + 0.20 * math.sin(ws * 0.7 * e + ph * 1.4))
-                ang = ph + wo * e
-                dx = int(round(math.cos(ang) * off))
-                dy = int(round(math.sin(ang) * off))
-                mask = self.sprite_glow.resize((gd, gd), Image.BILINEAR)
-                mask = mask.point(lambda a, q=peak: (a * q) // 255)
-                frame.paste(tint + (255,),
-                            (cx - gd // 2 + dx, cy - gd // 2 + dy), mask)
+            frame.alpha_composite(self._halo_layer(dd / 2.0, gi, e))
 
-        core = self.sprite_core.resize((d, d), Image.LANCZOS)
-        frame.paste(colour + (255,), (cx - d // 2, cy - d // 2), core)
-        frame = Image.alpha_composite(frame, self.tab)
-
-        label = str(phase_count(self.inhale, self.exhale, phase, left))
-        drw = self.ImageDraw.Draw(frame)
-        try:
-            drw.text(TAB_C, label, font=self.font, fill=TAB_INK + (255,),
-                     anchor="mm")
-        except (TypeError, ValueError):
-            w = drw.textlength(label, font=self.font)
-            drw.text((TAB_C[0] - w / 2, TAB_C[1] - 8), label, font=self.font,
-                     fill=TAB_INK + (255,))
-        return frame
+        frame.paste(colour + (255,),
+                    (cx - CORE_TILE // 2, cy - CORE_TILE // 2),
+                    self._core_tile(dd))
+        return self.Image.alpha_composite(
+            frame, self._tab_tile(phase_count(self.inhale, self.exhale,
+                                              phase, left)))
 
     def _frame(self):
         if not self.alive:
@@ -609,7 +684,17 @@ class Glass:
                     self.player.play(self.tick_out, "out")
 
         self._show(self.render(phase, fullness_at(phase, progress), left, e))
-        self.root.after(int(1000 / FPS), self._frame)
+
+        # Pace against a fixed grid, not against "now + 16ms": the latter adds
+        # however long the frame took to every interval, so the cadence sags
+        # and wobbles with the render cost. If we fall more than a frame
+        # behind, drop the arrears rather than sprinting to catch up.
+        self._due += 1.0 / FPS
+        slack = self._due - time.monotonic()
+        if slack < -1.0 / FPS:
+            self._due = time.monotonic()
+            slack = 0.0
+        self.root.after(max(1, int(slack * 1000)), self._frame)
 
     # ------------------------------------------------------ window chrome
 
