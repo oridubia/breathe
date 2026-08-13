@@ -4,8 +4,9 @@ breathe.py - a soft-tick breathing pacer, terminal or floating glass window
 
 Plays a soft tick at the start of each inhale and each exhale and shows the
 breath as a single expanding disc with a drifting halo, on a transparent
-window. The only text is a count that rises inside each phase (1,2,3,4 in;
-1,2,3,4,5,6 out) in a small white tab. Default pattern is 4s in, 6s out, with
+window. The only text is a count in a small white tab, running like a
+stopwatch inside each phase: 0,1,2,3 through the inhale then 4 while it is
+held, 0..5 through the exhale then 6. Default pattern is 4s in, 6s out, with
 a still half-second at each turnaround.
 
     python3 breathe.py --gui                 # floating always-on-top window
