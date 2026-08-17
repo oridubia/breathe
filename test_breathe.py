@@ -356,23 +356,13 @@ class _FakeStream:
 
 
 class _FakeSd:
-    def __init__(self, refuse=(), deaf=()):
+    def __init__(self, deaf=False):
         self.opened = []
-        self.refuse = refuse           # device ids that cannot be opened
-        self.deaf = deaf               # device ids that open but never call back
+        self.deaf = deaf               # opens and reports active, never calls back
 
     def OutputStream(self, **kw):
         self.opened.append(kw)
-        dev = kw.get("device")
-        if dev in self.refuse:
-            raise RuntimeError("device %r refused this rate" % dev)
-        return _FakeStream(callback=kw.get("callback"), deaf=dev in self.deaf)
-
-    def query_hostapis(self, index=None):
-        apis = [{"name": "MME", "default_output_device": 0},
-                {"name": "Windows WASAPI", "default_output_device": 4}]
-        return apis if index is None else apis[index]
-
+        return _FakeStream(callback=kw.get("callback"), deaf=self.deaf)
 
 def _wired_player(sd=None):
     """A Player on the sounddevice path, with the device faked out."""
@@ -460,50 +450,21 @@ def test_the_wav_is_written_once_and_reused():
     assert os.path.getmtime(first) == mtime
 
 
-def test_wasapi_is_preferred_over_mme_on_windows(monkeypatch):
-    """PortAudio defaults to MME, which underruns far more readily."""
-    monkeypatch.setattr(breathe.platform, "system", lambda: "Windows")
-    p = _wired_player()
-    assert p._pick_device() == 4          # the WASAPI default output
+def test_the_wav_is_rewritten_if_something_deletes_it():
+    """winsound plays from disk every time, so a temp sweeper removing the file
+    mid-session would silence the pacer permanently - and silently, since
+    SND_NODEFAULT means a failed play makes no sound at all."""
+    p = breathe.Player(silent=True)
+    tick = breathe.make_tick()
+    path = p._wav(tick, "in")
+    os.remove(path)
+    assert p._wav(tick, "in") == path
+    assert os.path.exists(path)
 
 
-def test_the_host_api_is_left_to_portaudio_off_windows(monkeypatch):
-    monkeypatch.setattr(breathe.platform, "system", lambda: "Linux")
-    p = _wired_player()
-    assert p._pick_device() is None
 
 
-def test_a_stream_that_opens_but_never_calls_back_is_rejected():
-    """The "I only heard one tick" failure.
 
-    A stream can start, report active, and never invoke its callback - WASAPI
-    does this when the endpoint disagrees about the format. The device pre-rolls
-    so the first tick sounds, and then nothing ever does again while every
-    counter insists the stream is healthy. Opening is not working, so it has to
-    be proven before the device is accepted.
-    """
-    p = _wired_player(sd=_FakeSd(deaf=(4,)))
-    p._preferred = 4
-    p.stream = None
-    p._open_stream()
-    assert [kw["device"] for kw in p.sd.opened] == [4, None]
-    assert p.device is None, "fell back to the working device"
-
-
-def test_every_candidate_being_deaf_raises_rather_than_pretending():
-    p = _wired_player(sd=_FakeSd(deaf=(4, None)))
-    p._preferred = 4
-    p.stream = None
-    with pytest.raises(Exception, match="no callbacks"):
-        p._open_stream()
-
-
-def test_a_rejected_stream_is_closed_not_leaked():
-    p = _wired_player(sd=_FakeSd(deaf=(4,)))
-    p._preferred = 4
-    p.stream = None
-    p._open_stream()
-    assert p.stream is not None and not p.stream.closed
 
 
 def test_callbacks_flowing_gives_up_rather_than_hanging():
@@ -548,16 +509,52 @@ def test_the_mix_is_clipped_so_a_pile_up_cannot_crack():
     assert float(numpy.abs(out).max()) <= 1.0
 
 
-def test_the_default_device_is_the_fallback_when_wasapi_refuses():
-    """WASAPI rejects rates the endpoint is not configured for; that must not
-    leave the pacer silent."""
-    p = _wired_player(sd=_FakeSd(refuse=(4,)))
-    p._preferred = 4
+
+def test_a_quiet_but_running_stream_is_never_reopened():
+    """The regression that produced "I heard one tick, the last of the eight".
+
+    _alive() once also asked "has the callback fired since the last tick". Any
+    false negative there reopened the stream on EVERY tick, and with the queue
+    carried across reopens the ticks piled up and then played all at once. Only
+    a stream that says outright that it stopped may be touched.
+    """
+    p = _wired_player()
+    p.cb_calls = 7
+    p._cb_seen = 7                       # no callback since the last tick
+    first = p.stream
+    p.play(breathe.make_tick(), "in")
+    assert p.restarts == 0, "reopened a stream that was running fine"
+    assert p.stream is first
+    assert len(p.voices) == 1
+
+
+def test_eight_ticks_in_a_row_never_reopen_or_pile_up():
+    p = _wired_player()
+    for i in range(8):
+        p.play(breathe.make_tick(), "in" if i % 2 == 0 else "out")
+    assert p.restarts == 0
+    assert p.sd.opened == [], "no stream should have been reopened at all"
+
+
+def test_a_stream_slow_to_call_back_is_kept_not_rejected():
+    """Refusing it would throw away the configuration that used to work."""
+    p = _wired_player(sd=_FakeSd(deaf=True))
     p.stream = None
     p._open_stream()
-    assert [kw["device"] for kw in p.sd.opened] == [4, None]
-    assert p.device is None
     assert p.stream is not None and p.stream.started
+    assert "slow to call back" in p.reason
+
+
+def test_the_stream_asks_for_low_latency_and_portaudio_s_own_device():
+    """The configuration this pacer worked on. Both a 256-frame buffer and a
+    4096-frame one were tried on untested theories and both made it worse."""
+    p = _wired_player()
+    p.stream = None
+    p._open_stream()
+    kw = p.sd.opened[-1]
+    assert kw["blocksize"] == breathe.BLOCKSIZE == 0
+    assert kw["latency"] == "low"
+    assert "device" not in kw, "the device choice is left to PortAudio"
 
 
 def test_a_stream_reporting_inactive_is_reopened_on_the_next_tick():
@@ -568,15 +565,6 @@ def test_a_stream_reporting_inactive_is_reopened_on_the_next_tick():
     assert p.sd.opened, "no replacement stream was opened"
     assert p.stream.started
 
-
-def test_a_wedged_stream_that_stopped_calling_back_is_reopened():
-    """stream.active keeps saying True for a stream that has quietly died,
-    so the callback counter is the ground truth."""
-    p = _wired_player()
-    p.cb_calls = 7
-    p._cb_seen = 7                       # no callback since the last tick
-    p.play(breathe.make_tick(), "in")
-    assert p.restarts == 1
 
 
 def test_a_healthy_stream_is_left_alone():

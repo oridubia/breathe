@@ -79,11 +79,13 @@ SR = 44100
 TICK_IN_HZ  = 988.0
 TICK_OUT_HZ = 659.0
 
-# ~93ms of audio per callback. Small buffers (the old 256 frames, 5.8ms) lose
-# the race for the GIL against the render loop, and a callback that returns
-# late means the driver has already inserted a gap - the tick then plays into
-# a hole nobody hears. Latency is irrelevant here, tolerance is everything.
-BLOCKSIZE = 4096
+# 0 means "PortAudio picks", which with latency="low" is the configuration this
+# pacer shipped with and ran on perfectly. Both a 256-frame buffer and a 4096
+# one were tried here on theories about GIL starvation and underrun tolerance;
+# neither was measured on real hardware and both made things worse. Do not
+# change these again without a machine that actually drops ticks to test on.
+# --blocksize overrides it for experiments.
+BLOCKSIZE = 0
 
 # The mixing callback is Python, so it competes with the render loop for the
 # GIL. Switch threads eagerly so the audio thread does not wait a full
@@ -261,8 +263,6 @@ class Player:
         self.requested = 0            # ticks handed to the backend
         self.cb_calls = 0             # callback invocations, for liveness
         self._cb_seen = -1
-        self.device = None
-        self._preferred = None
         if silent:
             self.mode = "silent"
             return
@@ -292,7 +292,6 @@ class Player:
                            for d in sd.query_devices()):
                     raise RuntimeError("no output device exists")
                 self.sd = sd
-                self._preferred = self._pick_device()
                 self._open_stream()
                 self.mode = "sounddevice"
                 return
@@ -310,36 +309,13 @@ class Player:
                         self.reason = "using system player (higher latency)"
                     return
 
-    def _pick_device(self):
-        """Prefer WASAPI on Windows.
-
-        PortAudio defaults to MME there, which is the oldest host API on the
-        machine and the one most willing to glitch: high latency, coarse
-        buffering, and it starves under load where WASAPI rides through. An
-        underrun is not a bookkeeping problem - by the time the callback is
-        late the driver has already inserted a gap and moved on, so the tick
-        gets played into a hole nobody hears. Avoiding the underrun is the
-        only real fix, so start on the better host API. None means "let
-        PortAudio decide", and _open_stream falls back to that anyway.
-        """
-        try:
-            if platform.system() != "Windows":
-                return None
-            for api in self.sd.query_hostapis():
-                if "WASAPI" in api["name"].upper() \
-                        and api.get("default_output_device", -1) >= 0:
-                    return api["default_output_device"]
-        except Exception:
-            pass
-        return None
-
     def _open_stream(self):
-        """(Re)open the output stream, preferred device first.
+        """(Re)open the output stream on PortAudio's default device.
 
-        A big buffer on purpose. The mixing callback is Python, so it competes
-        with the render loop for the GIL; blocksize frames give it a generous
-        deadline instead of the 5.8ms a 256-frame buffer allowed, and latency
-        is irrelevant when the next tick is seconds away.
+        Deliberately whatever PortAudio picks, at BLOCKSIZE and latency="low" -
+        the configuration this pacer ran on perfectly before any of the audio
+        "fixes". Preferring WASAPI over the default was one of those fixes and
+        it made things dramatically worse, so the device choice is left alone.
         """
         if self.stream is not None:
             try:
@@ -358,42 +334,20 @@ class Player:
         with self.lock:
             self.voices = []
 
-        # WASAPI can refuse a rate the endpoint is not configured for, so the
-        # default device stays as the fallback rather than the only option.
-        candidates = [self._preferred, None] if self._preferred is not None \
-            else [None]
-        last = None
-        for device in candidates:
-            try:
-                self.stream = self.sd.OutputStream(
-                    samplerate=SR, channels=1, dtype="float32",
-                    blocksize=self.blocksize, device=device, callback=self._cb,
-                )
-                # Count from BEFORE the start, or a callback that fires during
-                # startup is missed and a working stream looks like a dud.
-                before = self.cb_calls
-                self.stream.start()
-                # Opening is not working. A stream can start, report active and
-                # never call back - WASAPI does exactly this when the endpoint
-                # disagrees about the format, and MME can too. The symptom is
-                # brutal and misleading: the first tick sounds because the
-                # device pre-rolls, then nothing ever does again, while every
-                # counter says the stream is fine. So prove it before trusting
-                # it, and fall through to the next device if it is a dud.
-                if not self._callbacks_flowing(before):
-                    raise RuntimeError(
-                        "stream started but produced no callbacks")
-                self.device = device
-                return
-            except Exception as e:
-                last = e
-                if self.stream is not None:
-                    try:
-                        self.stream.close(ignore_errors=True)
-                    except Exception:
-                        pass
-                self.stream = None
-        raise last
+        self.stream = self.sd.OutputStream(
+            samplerate=SR, channels=1, dtype="float32",
+            blocksize=self.blocksize, latency="low", callback=self._cb,
+        )
+        # Count from BEFORE the start, or a callback that fires during startup
+        # is missed and a working stream looks like a dud.
+        before = self.cb_calls
+        self.stream.start()
+        if not self._callbacks_flowing(before):
+            # Note it, never reject it. A stream can start, report active and be
+            # slow to call back; refusing it here would throw away the
+            # configuration that used to work, which is a worse trade than a
+            # diagnostic line. --test surfaces this.
+            self.reason = "stream opened but was slow to call back"
 
     def _callbacks_flowing(self, seen, timeout=0.4):
         """Wait briefly for the callback to fire past the given count."""
@@ -409,30 +363,27 @@ class Player:
         if self.mode != "sounddevice":
             return "n/a"
         try:
-            dev = self.sd.query_devices(
-                self.device if self.device is not None else None, "output")
+            dev = self.sd.query_devices(None, "output")
             return "%s / %s" % (self.sd.query_hostapis(dev["hostapi"])["name"],
                                 dev["name"])
         except Exception:
             return "?"
 
     def _alive(self):
-        """Is the stream still really running?
+        """Is the stream still open and running?
 
-        Not the same question as stream.active, which keeps saying True for a
-        stream that has quietly stopped calling back. The callback counter is
-        the ground truth: if it has not moved since the last tick - seconds ago
-        - then nothing is draining the queue and the device has gone away.
+        Deliberately only stream.active. A stricter test - "has the callback
+        fired since the last tick" - looks smarter and was a disaster: any
+        false negative reopened the stream on every single tick, and with the
+        queue carried across reopens the ticks piled up and then played all at
+        once. The original pacer never checked at all and worked perfectly, so
+        this stays as conservative as possible: only act on a stream that says
+        outright that it has stopped.
         """
         try:
-            if self.stream is None or not self.stream.active:
-                return False
+            return self.stream is not None and self.stream.active
         except Exception:
             return False
-        if self._cb_seen == self.cb_calls:
-            return False
-        self._cb_seen = self.cb_calls
-        return True
 
     def _cb(self, outdata, frames, timeinfo, status):
         # Bumped FIRST and outside the try: _alive() reads this to decide
@@ -479,8 +430,13 @@ class Player:
                 pass
 
     def _wav(self, samples, key):
-        if key in self.tmp:
-            return self.tmp[key]
+        # Check it is still THERE, not merely that we wrote it once. winsound
+        # plays from disk every time, so a temp sweeper deleting this file mid
+        # session would silence the pacer for good - and with SND_NODEFAULT it
+        # would fail silently, which is the worst way to fail.
+        cached = self.tmp.get(key)
+        if cached is not None and os.path.exists(cached):
+            return cached
         path = os.path.join(tempfile.gettempdir(), f"breathe_{key}.wav")
         pcm = (np.clip(samples, -1, 1) * 32767).astype("<i2")
         with wave.open(path, "wb") as w:
@@ -1113,11 +1069,9 @@ def selftest(volume, debug=False, blocksize=None, backend="auto"):
         print(f"  device: {p.host_api()}")
         print(f"  buffer: {p.blocksize} frames "
               f"({p.blocksize / SR * 1000:.0f}ms per callback)")
-        if "MME" in p.host_api().upper():
-            print("  \033[93m  MME is the flakiest host API on Windows and "
-                  "underruns readily.\033[0m")
-            print("  \033[2m  WASAPI was preferred but could not be opened at "
-                  "this rate.\033[0m")
+        if platform.system() == "Windows":
+            print("  \033[2m  if ticks go missing here, use the default "
+                  "backend (winsound) instead.\033[0m")
     elif p.mode == "bell":
         print("  \033[91m  no real audio backend. you will hear nothing.\033[0m")
         print("  \033[2m  fix: pip install sounddevice\033[0m")
