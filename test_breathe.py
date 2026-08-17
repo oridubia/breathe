@@ -169,7 +169,33 @@ def test_tick_is_deterministic():
 
 
 def test_inhale_and_exhale_ticks_are_distinguishable():
-    assert not (breathe.make_tick(740.0) == breathe.make_tick(494.0)).all()
+    assert not (breathe.make_tick(breathe.TICK_IN_HZ)
+                == breathe.make_tick(breathe.TICK_OUT_HZ)).all()
+
+
+def test_both_ticks_clear_the_speaker_rolloff():
+    """A laptop speaker rolls off steeply under ~600Hz. The old exhale tick at
+    494Hz put 48% of its energy below 500Hz, so its fundamental was thrown
+    away and it went inaudible on small speakers while the inhale tick was
+    fine. Neither tick may sit on that cliff again.
+    """
+    import numpy
+    for hz in (breathe.TICK_IN_HZ, breathe.TICK_OUT_HZ):
+        x = breathe.make_tick(hz, volume=0.25).astype(numpy.float64)
+        power = numpy.abs(numpy.fft.rfft(x)) ** 2
+        freq = numpy.fft.rfftfreq(len(x), 1.0 / breathe.SR)
+        below = power[freq < 500].sum() / power.sum()
+        assert below < 0.05, "%.0fHz puts %.0f%% of its energy under 500Hz" % (
+            hz, below * 100)
+        assert hz > 600.0
+
+
+def test_the_two_ticks_are_equally_loud():
+    """The exhale tick used to be attenuated to 0.85 on top of being filtered
+    out by the speaker."""
+    a = breathe.make_tick(breathe.TICK_IN_HZ, volume=0.25)
+    b = breathe.make_tick(breathe.TICK_OUT_HZ, volume=0.25)
+    assert abs(float(abs(a).max()) - float(abs(b).max())) < 1e-6
 
 
 class _Status:
@@ -231,13 +257,113 @@ def test_the_callback_counts_underruns_and_reports_them():
     for _ in range(3):
         p._cb(_outdata(256), 256, None, _Status(output_underflow=True))
     assert p.underruns == 3
-    assert "3 times" in p.report()
+    assert "3 buffer underrun" in p.report()
 
 
 def test_a_clean_run_reports_nothing():
     p = breathe.Player(silent=True)
     p._cb(_outdata(256), 256, None, _Status())
     assert p.report() == ""
+
+
+# --------------------------------------------- the stream that dies on you
+# "No ticks for five minutes" is an output stream that stopped and was never
+# noticed. These cover the recovery, since the real failure needs a Windows
+# audio device to be yanked away and cannot be reproduced in a test.
+
+class _FakeStream:
+    def __init__(self, active=True):
+        self._active = active
+        self.started = False
+        self.closed = False
+
+    @property
+    def active(self):
+        return self._active
+
+    def start(self):
+        self.started = True
+
+    def close(self, ignore_errors=False):
+        self.closed = True
+
+
+class _FakeSd:
+    def __init__(self):
+        self.opened = []
+
+    def OutputStream(self, **kw):
+        self.opened.append(kw)
+        return _FakeStream()
+
+
+def _wired_player():
+    """A Player on the sounddevice path, with the device faked out."""
+    p = breathe.Player(silent=True)
+    p.mode = "sounddevice"
+    p.sd = _FakeSd()
+    p.stream = _FakeStream()
+    return p
+
+
+def test_a_stream_reporting_inactive_is_reopened_on_the_next_tick():
+    p = _wired_player()
+    p.stream._active = False
+    p.play(breathe.make_tick(), "in")
+    assert p.restarts == 1
+    assert p.sd.opened, "no replacement stream was opened"
+    assert p.stream.started
+
+
+def test_a_wedged_stream_that_stopped_calling_back_is_reopened():
+    """stream.active keeps saying True for a stream that has quietly died,
+    so the callback counter is the ground truth."""
+    p = _wired_player()
+    p.cb_calls = 7
+    p._cb_seen = 7                       # no callback since the last tick
+    p.play(breathe.make_tick(), "in")
+    assert p.restarts == 1
+
+
+def test_a_healthy_stream_is_left_alone():
+    p = _wired_player()
+    p.cb_calls, p._cb_seen = 50, 10      # callbacks have been running
+    first = p.stream
+    p.play(breathe.make_tick(), "in")
+    assert p.restarts == 0
+    assert p.stream is first
+    assert p.voices, "the tick was not queued"
+
+
+def test_a_failed_reopen_is_counted_rather_than_raised():
+    p = _wired_player()
+    p.stream._active = False
+
+    class _Boom:
+        def OutputStream(self, **kw):
+            raise RuntimeError("device gone")
+
+    p.sd = _Boom()
+    p.play(breathe.make_tick(), "in")    # must not raise
+    assert p.failures == 1 and p.restarts == 0
+    assert "reopen" in p.report()
+
+
+def test_the_callback_never_lets_an_exception_reach_portaudio():
+    """PortAudio aborts a stream for good if a callback raises, which is the
+    silent-for-minutes failure. One bad buffer must not end the session."""
+    p = breathe.Player(silent=True)
+    p.voices.append(("not an array at all", 0))
+    out = _outdata(256)
+    p._cb(out, 256, None, _Status())      # must not raise
+    assert p.cb_calls == 1, "liveness counter must move even on a bad frame"
+
+
+def test_the_liveness_counter_moves_on_every_callback():
+    p = breathe.Player(silent=True)
+    for i in range(5):
+        p._cb(_outdata(256), 256, None, _Status())
+        assert p.cb_calls == i + 1
 
 
 def test_silent_player_stays_quiet():

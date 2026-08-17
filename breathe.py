@@ -68,6 +68,24 @@ except ImportError:
 
 SR = 44100
 
+# Inhale high, exhale a fifth below it - but BOTH clear of ~600Hz, because a
+# laptop speaker rolls off hard under that and throws the fundamental away.
+# The old pair was 740/494: the exhale tick's fundamental sat below the cliff,
+# so half its energy went missing and it was inaudible on small speakers while
+# the inhale tick came through fine. Same interval, transposed up. Equal
+# volume too - the exhale used to be attenuated on top of being filtered out.
+TICK_IN_HZ  = 988.0
+TICK_OUT_HZ = 659.0
+
+# ~46ms of audio per callback. Small buffers (the old 256 frames, 5.8ms) lose
+# the race for the GIL against the render loop and swallow ticks.
+BLOCKSIZE = 2048
+
+# The mixing callback is Python, so it competes with the render loop for the
+# GIL. Switch threads eagerly so the audio thread does not wait a full
+# interpreter slice behind a frame that is busy compositing.
+sys.setswitchinterval(0.002)
+
 
 # ============================================================ APPEARANCE
 
@@ -211,35 +229,30 @@ class Player:
     """Persistent output stream so a tick costs ~0ms instead of reopening
     the device every time. Falls back to a system player, then the bell."""
 
-    def __init__(self, silent=False):
+    def __init__(self, silent=False, debug=False):
         self.mode = "bell"
         self.reason = ""
+        self.debug = debug
         self.tmp = {}
         self.voices = []
-        self.underruns = 0
         self.lock = threading.Lock()
+        self.stream = None
+        self.sd = None
+        self.underruns = 0            # callback ran, device had already starved
+        self.restarts = 0             # stream found dead and reopened
+        self.failures = 0             # reopen attempts that did not take
+        self.requested = 0            # ticks handed to the backend
+        self.cb_calls = 0             # callback invocations, for liveness
+        self._cb_seen = -1
         if silent:
             self.mode = "silent"
             return
         try:
             import sounddevice as sd
-            devs = sd.query_devices()
-            if not any(d["max_output_channels"] > 0 for d in devs):
+            if not any(d["max_output_channels"] > 0 for d in sd.query_devices()):
                 raise RuntimeError("no output device exists")
             self.sd = sd
-            # Deliberately NOT a small buffer or latency="low". The mixing
-            # callback below is Python, so it needs the GIL, and the render
-            # loop holds the GIL for a few ms of every frame. A 256-frame
-            # buffer gives the callback 5.8ms to be scheduled, wake up and
-            # finish - it loses that race often enough to swallow whole ticks.
-            # Let PortAudio pick the buffer and take the device's default
-            # latency: tens of ms is inaudible on a 4-second inhale, and a
-            # tick you actually hear beats a prompt one you don't.
-            self.stream = sd.OutputStream(
-                samplerate=SR, channels=1, dtype="float32",
-                blocksize=0, callback=self._cb,
-            )
-            self.stream.start()
+            self._open_stream()
             self.mode = "sounddevice"
             return
         except ImportError:
@@ -255,22 +268,76 @@ class Player:
                     self.reason = "using system player (higher latency)"
                 return
 
+    def _open_stream(self):
+        """(Re)open the output stream.
+
+        A big buffer on purpose. The mixing callback is Python, so it competes
+        with the render loop for the GIL; BLOCKSIZE frames give it a generous
+        deadline instead of the 5.8ms a 256-frame buffer allowed, and latency
+        is irrelevant when the next tick is seconds away.
+        """
+        if self.stream is not None:
+            try:
+                self.stream.close(ignore_errors=True)
+            except Exception:
+                pass
+            self.stream = None
+        self.stream = self.sd.OutputStream(
+            samplerate=SR, channels=1, dtype="float32",
+            blocksize=BLOCKSIZE, callback=self._cb,
+        )
+        self.stream.start()
+
+    def _alive(self):
+        """Is the stream still really running?
+
+        Not the same question as stream.active, which keeps saying True for a
+        stream that has quietly stopped calling back. The callback counter is
+        the ground truth: if it has not moved since the last tick - seconds ago
+        - then nothing is draining the queue and the device has gone away.
+        """
+        try:
+            if self.stream is None or not self.stream.active:
+                return False
+        except Exception:
+            return False
+        if self._cb_seen == self.cb_calls:
+            return False
+        self._cb_seen = self.cb_calls
+        return True
+
     def _cb(self, outdata, frames, timeinfo, status):
-        # A dropped tick is silent in every sense, so count the drops: this is
-        # the difference between "the pacer is broken" and "the audio buffer
-        # underran 40 times", which is a thing you can act on.
-        if status and status.output_underflow:
-            self.underruns += 1
-        outdata.fill(0)
-        with self.lock:
-            still = []
-            for samples, pos in self.voices:
-                chunk = samples[pos:pos + frames]
-                if len(chunk):
-                    outdata[:len(chunk), 0] += chunk
-                    if pos + frames < len(samples):
-                        still.append((samples, pos + frames))
-            self.voices = still
+        # Bumped FIRST and outside the try: _alive() reads this to decide
+        # whether the device is still there, so it must move on every call
+        # even if the mix below goes wrong.
+        self.cb_calls += 1
+        try:
+            # Count starved buffers. This is the difference between "the pacer
+            # is broken" and "the buffer underran 40 times", which is
+            # actionable. getattr, not attribute access: an exception raised
+            # in here would abort the stream for good.
+            if getattr(status, "output_underflow", False):
+                self.underruns += 1
+            outdata.fill(0)
+            with self.lock:
+                still = []
+                for samples, pos in self.voices:
+                    chunk = samples[pos:pos + frames]
+                    if len(chunk):
+                        outdata[:len(chunk), 0] += chunk
+                        if pos + frames < len(samples):
+                            still.append((samples, pos + frames))
+                self.voices = still
+        except Exception:
+            # PortAudio ABORTS the stream permanently if an exception escapes
+            # a callback - one bad frame would mean silence until restart,
+            # which is the "no ticks for five minutes" failure. Never let one
+            # out: lose this buffer instead, and let _alive() recover if the
+            # stream really is gone.
+            try:
+                outdata.fill(0)
+            except Exception:
+                pass
 
     def _wav(self, samples, key):
         if key in self.tmp:
@@ -286,7 +353,21 @@ class Player:
         return path
 
     def play(self, samples, key):
+        self.requested += 1
+        if self.debug:
+            print("[audio] %8.2fs tick=%-3s %s" % (
+                time.monotonic() % 10000, key, self.state()), flush=True)
         if self.mode == "sounddevice":
+            # Check on the way in, not on a timer: a tick is the only moment
+            # the answer matters, and it is cheap next to being silent.
+            if not self._alive():
+                try:
+                    self._open_stream()
+                    self.restarts += 1
+                    self._cb_seen = -1
+                except Exception as e:
+                    self.failures += 1
+                    self.reason = f"stream restart failed: {e}"
             with self.lock:
                 self.voices.append((samples, 0))
         elif self.mode == "system":
@@ -296,13 +377,35 @@ class Player:
             sys.stdout.write("\a")
             sys.stdout.flush()
 
+    def state(self):
+        """Live one-liner for --debug-audio."""
+        if self.mode != "sounddevice":
+            active = "n/a"                 # no stream in this mode by design
+        else:
+            try:
+                active = "active" if self.stream is not None \
+                    and self.stream.active else "DEAD"
+            except Exception:
+                active = "DEAD"
+        return ("%s stream=%s cb=%d queued=%d underruns=%d restarts=%d"
+                % (self.mode, active, self.cb_calls, len(self.voices),
+                   self.underruns, self.restarts))
+
     def report(self):
-        """One line about dropped audio, or nothing at all when it was fine."""
+        """What went wrong with the audio, or nothing at all when it was fine."""
+        bits = []
+        if self.restarts:
+            bits.append("the output device dropped out %d time(s) and was "
+                        "reopened" % self.restarts)
+        if self.failures:
+            bits.append("%d reopen attempt(s) failed" % self.failures)
         if self.underruns:
-            return ("audio buffer underran %d times - some ticks were dropped. "
-                    "close what is competing for the sound device, or run with "
-                    "--silent and watch the orb." % self.underruns)
-        return ""
+            bits.append("%d buffer underrun(s)" % self.underruns)
+        if not bits:
+            return ""
+        return ("audio trouble over %d ticks: %s.\n"
+                "  If ticks went missing, re-run with --debug-audio and send "
+                "the log." % (self.requested, "; ".join(bits)))
 
     def close(self):
         if self.mode == "sounddevice":
@@ -336,8 +439,8 @@ class Glass:
 
         self.inhale, self.exhale, self.hold = inhale, exhale, hold
         self.player, self.total = player, total
-        self.tick_in = make_tick(740.0, volume=volume)
-        self.tick_out = make_tick(494.0, volume=volume * 0.85)
+        self.tick_in = make_tick(TICK_IN_HZ, volume=volume)
+        self.tick_out = make_tick(TICK_OUT_HZ, volume=volume)
         self.last_key = None
         self.paused = False
         self.pause_at = 0.0
@@ -777,15 +880,16 @@ def fmt(sec):
     return f"{int(sec) // 60:d}:{int(sec) % 60:02d}"
 
 
-def run_term(inhale, exhale, hold, total, volume, silent, plain):
-    player = Player(silent)
+def run_term(inhale, exhale, hold, total, volume, silent, plain,
+             debug=False):
+    player = Player(silent, debug=debug)
     if player.mode == "bell":
         print(f"  \033[91mno audio backend ({player.reason or 'none found'}).\033[0m")
         print("  \033[2mrun: pip install sounddevice     then try again\033[0m")
         print("  \033[2mcontinuing with the visual bar only.\033[0m\n")
 
-    tick_in = make_tick(740.0, volume=volume)
-    tick_out = make_tick(494.0, volume=volume * 0.85)
+    tick_in = make_tick(TICK_IN_HZ, volume=volume)
+    tick_out = make_tick(TICK_OUT_HZ, volume=volume)
     start = time.monotonic()
     last_key = None
     cycles = 0
@@ -835,10 +939,12 @@ def run_term(inhale, exhale, hold, total, volume, silent, plain):
         player.close()
 
     print(f"done. {fmt(time.monotonic() - start)}, {cycles} cycles")
+    if player.report():
+        print(f"  \033[91m{player.report()}\033[0m")
 
 
-def selftest(volume):
-    p = Player(False)
+def selftest(volume, debug=False):
+    p = Player(False, debug=debug)
     print(f"\n  backend: \033[1m{p.mode}\033[0m")
     if p.reason:
         print(f"  \033[2m{p.reason}\033[0m")
@@ -854,8 +960,8 @@ def selftest(volume):
         print("  \033[2m  linux also needs: sudo apt install libportaudio2\033[0m")
 
     print(f"\n  playing 8 ticks at volume {volume:g} - every one should sound...")
-    t_in = make_tick(740.0, volume=volume)
-    t_out = make_tick(494.0, volume=volume * 0.85)
+    t_in = make_tick(TICK_IN_HZ, volume=volume)
+    t_out = make_tick(TICK_OUT_HZ, volume=volume)
     for i in range(8):
         p.play(t_in if i % 2 == 0 else t_out, "in" if i % 2 == 0 else "out")
         print(f"    tick {i + 1}")
@@ -887,6 +993,8 @@ def main():
     p.add_argument("--volume", type=float, default=0.25)
     p.add_argument("--silent", action="store_true")
     p.add_argument("--test", action="store_true", help="check audio, then exit")
+    p.add_argument("--debug-audio", action="store_true",
+                   help="log every tick and the stream state, to find dropouts")
     a = p.parse_args()
 
     if a.inhale <= 0 or a.exhale <= 0:
@@ -894,7 +1002,7 @@ def main():
     hold = max(0.0, a.hold)
 
     if a.test:
-        return selftest(a.volume)
+        return selftest(a.volume, a.debug_audio)
 
     total = None if a.minutes is None else a.minutes * 60
 
@@ -906,7 +1014,7 @@ def main():
             sys.exit(f"gui needs tkinter and pillow ({e})\n"
                      f"  pip install pillow\n"
                      f"  linux also: sudo apt install python3-tk")
-        pl = Player(a.silent)
+        pl = Player(a.silent, debug=a.debug_audio)
         g = Glass(a.inhale, a.exhale, hold, pl, a.volume, total)
         try:
             g.run()
@@ -926,7 +1034,8 @@ def main():
         print(f"  \033[2m{a.inhale:g} in / {exhale:g} out  ·  {length}  ·  ctrl-c to stop\033[0m")
     print("\033[2m  nose only. belly moves, chest doesn't. keep it small.\033[0m\n")
     time.sleep(1.5)
-    run_term(a.inhale, exhale, hold, total, a.volume, a.silent, plain)
+    run_term(a.inhale, exhale, hold, total, a.volume, a.silent, plain,
+             a.debug_audio)
 
 
 if __name__ == "__main__":
