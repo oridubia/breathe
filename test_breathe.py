@@ -279,13 +279,44 @@ def test_a_finished_tick_is_dropped_from_the_mix():
     assert p.voices == []
 
 
-def test_the_callback_counts_underruns_and_reports_them():
+def test_an_underrun_hitting_silence_is_reported_as_harmless():
+    """Nothing was sounding, so the glitch cost nothing."""
     p = breathe.Player(silent=True)
     assert p.underruns == 0 and p.report() == ""
     for _ in range(3):
         p._cb(_outdata(256), 256, None, _Status(output_underflow=True))
     assert p.underruns == 3
-    assert "3 buffer underrun" in p.report()
+    assert p.underruns_in_tick == 0
+    assert "harmless" in p.report()
+
+
+def test_an_underrun_during_a_tick_is_counted_as_a_lost_tick():
+    """The one that really costs you the sound.
+
+    By the time the callback is late the driver has already inserted a gap and
+    moved on, so those samples play where nobody hears them. The queue drains
+    cleanly afterwards and every other counter looks healthy, which is why this
+    had to be measured separately rather than inferred.
+    """
+    p = breathe.Player(silent=True)
+    p.voices.append((breathe.make_tick(), 0))        # a tick is sounding
+    p._cb(_outdata(256), 256, None, _Status(output_underflow=True))
+    assert p.underruns == 1
+    assert p.underruns_in_tick == 1
+    assert "clipped or lost" in p.report()
+    assert "harmless" not in p.report()
+
+
+def test_underruns_are_split_between_damaging_and_harmless():
+    p = breathe.Player(silent=True)
+    p.voices.append((breathe.make_tick(), 0))
+    p._cb(_outdata(256), 256, None, _Status(output_underflow=True))
+    p.voices.clear()
+    for _ in range(4):
+        p._cb(_outdata(256), 256, None, _Status(output_underflow=True))
+    assert (p.underruns, p.underruns_in_tick) == (5, 1)
+    assert "1 underrun(s) landed WHILE" in p.report()
+    assert "4 underrun(s) hit silence" in p.report()
 
 
 def test_a_clean_run_reports_nothing():
@@ -317,21 +348,54 @@ class _FakeStream:
 
 
 class _FakeSd:
-    def __init__(self):
+    def __init__(self, refuse=()):
         self.opened = []
+        self.refuse = refuse           # device ids that cannot be opened
 
     def OutputStream(self, **kw):
         self.opened.append(kw)
+        if kw.get("device") in self.refuse:
+            raise RuntimeError("device %r refused this rate" % kw.get("device"))
         return _FakeStream()
 
+    def query_hostapis(self, index=None):
+        apis = [{"name": "MME", "default_output_device": 0},
+                {"name": "Windows WASAPI", "default_output_device": 4}]
+        return apis if index is None else apis[index]
 
-def _wired_player():
+
+def _wired_player(sd=None):
     """A Player on the sounddevice path, with the device faked out."""
     p = breathe.Player(silent=True)
     p.mode = "sounddevice"
-    p.sd = _FakeSd()
+    p.sd = sd or _FakeSd()
     p.stream = _FakeStream()
     return p
+
+
+def test_wasapi_is_preferred_over_mme_on_windows(monkeypatch):
+    """PortAudio defaults to MME, which underruns far more readily."""
+    monkeypatch.setattr(breathe.platform, "system", lambda: "Windows")
+    p = _wired_player()
+    assert p._pick_device() == 4          # the WASAPI default output
+
+
+def test_the_host_api_is_left_to_portaudio_off_windows(monkeypatch):
+    monkeypatch.setattr(breathe.platform, "system", lambda: "Linux")
+    p = _wired_player()
+    assert p._pick_device() is None
+
+
+def test_the_default_device_is_the_fallback_when_wasapi_refuses():
+    """WASAPI rejects rates the endpoint is not configured for; that must not
+    leave the pacer silent."""
+    p = _wired_player(sd=_FakeSd(refuse=(4,)))
+    p._preferred = 4
+    p.stream = None
+    p._open_stream()
+    assert [kw["device"] for kw in p.sd.opened] == [4, None]
+    assert p.device is None
+    assert p.stream is not None and p.stream.started
 
 
 def test_a_stream_reporting_inactive_is_reopened_on_the_next_tick():

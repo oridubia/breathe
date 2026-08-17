@@ -79,9 +79,11 @@ SR = 44100
 TICK_IN_HZ  = 988.0
 TICK_OUT_HZ = 659.0
 
-# ~46ms of audio per callback. Small buffers (the old 256 frames, 5.8ms) lose
-# the race for the GIL against the render loop and swallow ticks.
-BLOCKSIZE = 2048
+# ~93ms of audio per callback. Small buffers (the old 256 frames, 5.8ms) lose
+# the race for the GIL against the render loop, and a callback that returns
+# late means the driver has already inserted a gap - the tick then plays into
+# a hole nobody hears. Latency is irrelevant here, tolerance is everything.
+BLOCKSIZE = 4096
 
 # The mixing callback is Python, so it competes with the render loop for the
 # GIL. Switch threads eagerly so the audio thread does not wait a full
@@ -240,7 +242,7 @@ class Player:
     """Persistent output stream so a tick costs ~0ms instead of reopening
     the device every time. Falls back to a system player, then the bell."""
 
-    def __init__(self, silent=False, debug=False):
+    def __init__(self, silent=False, debug=False, blocksize=None):
         self.mode = "bell"
         self.reason = ""
         self.debug = debug
@@ -249,12 +251,16 @@ class Player:
         self.lock = threading.Lock()
         self.stream = None
         self.sd = None
+        self.blocksize = blocksize or BLOCKSIZE
         self.underruns = 0            # callback ran, device had already starved
+        self.underruns_in_tick = 0    # ...while a tick was actually sounding
         self.restarts = 0             # stream found dead and reopened
         self.failures = 0             # reopen attempts that did not take
         self.requested = 0            # ticks handed to the backend
         self.cb_calls = 0             # callback invocations, for liveness
         self._cb_seen = -1
+        self.device = None
+        self._preferred = None
         if silent:
             self.mode = "silent"
             return
@@ -263,6 +269,7 @@ class Player:
             if not any(d["max_output_channels"] > 0 for d in sd.query_devices()):
                 raise RuntimeError("no output device exists")
             self.sd = sd
+            self._preferred = self._pick_device()
             self._open_stream()
             self.mode = "sounddevice"
             return
@@ -279,11 +286,34 @@ class Player:
                     self.reason = "using system player (higher latency)"
                 return
 
+    def _pick_device(self):
+        """Prefer WASAPI on Windows.
+
+        PortAudio defaults to MME there, which is the oldest host API on the
+        machine and the one most willing to glitch: high latency, coarse
+        buffering, and it starves under load where WASAPI rides through. An
+        underrun is not a bookkeeping problem - by the time the callback is
+        late the driver has already inserted a gap and moved on, so the tick
+        gets played into a hole nobody hears. Avoiding the underrun is the
+        only real fix, so start on the better host API. None means "let
+        PortAudio decide", and _open_stream falls back to that anyway.
+        """
+        try:
+            if platform.system() != "Windows":
+                return None
+            for api in self.sd.query_hostapis():
+                if "WASAPI" in api["name"].upper() \
+                        and api.get("default_output_device", -1) >= 0:
+                    return api["default_output_device"]
+        except Exception:
+            pass
+        return None
+
     def _open_stream(self):
-        """(Re)open the output stream.
+        """(Re)open the output stream, preferred device first.
 
         A big buffer on purpose. The mixing callback is Python, so it competes
-        with the render loop for the GIL; BLOCKSIZE frames give it a generous
+        with the render loop for the GIL; blocksize frames give it a generous
         deadline instead of the 5.8ms a 256-frame buffer allowed, and latency
         is irrelevant when the next tick is seconds away.
         """
@@ -293,11 +323,37 @@ class Player:
             except Exception:
                 pass
             self.stream = None
-        self.stream = self.sd.OutputStream(
-            samplerate=SR, channels=1, dtype="float32",
-            blocksize=BLOCKSIZE, callback=self._cb,
-        )
-        self.stream.start()
+
+        # WASAPI can refuse a rate the endpoint is not configured for, so the
+        # default device stays as the fallback rather than the only option.
+        candidates = [self._preferred, None] if self._preferred is not None \
+            else [None]
+        last = None
+        for device in candidates:
+            try:
+                self.stream = self.sd.OutputStream(
+                    samplerate=SR, channels=1, dtype="float32",
+                    blocksize=self.blocksize, device=device, callback=self._cb,
+                )
+                self.stream.start()
+                self.device = device
+                return
+            except Exception as e:
+                last = e
+                self.stream = None
+        raise last
+
+    def host_api(self):
+        """Which host API we actually landed on - MME vs WASAPI matters."""
+        if self.mode != "sounddevice":
+            return "n/a"
+        try:
+            dev = self.sd.query_devices(
+                self.device if self.device is not None else None, "output")
+            return "%s / %s" % (self.sd.query_hostapis(dev["hostapi"])["name"],
+                                dev["name"])
+        except Exception:
+            return "?"
 
     def _alive(self):
         """Is the stream still really running?
@@ -323,14 +379,21 @@ class Player:
         # even if the mix below goes wrong.
         self.cb_calls += 1
         try:
-            # Count starved buffers. This is the difference between "the pacer
-            # is broken" and "the buffer underran 40 times", which is
-            # actionable. getattr, not attribute access: an exception raised
-            # in here would abort the stream for good.
-            if getattr(status, "output_underflow", False):
+            # getattr, not attribute access: an exception raised in here would
+            # abort the stream for good.
+            under = bool(getattr(status, "output_underflow", False))
+            if under:
                 self.underruns += 1
             outdata.fill(0)
             with self.lock:
+                # THE measurement that matters. An underrun with nothing
+                # sounding is harmless - it glitched silence. An underrun while
+                # a tick is mid-flight means the driver had already inserted a
+                # gap and moved on, so those samples went somewhere nobody
+                # heard: that is a tick lost for real, with the queue still
+                # looking perfectly healthy afterwards.
+                if under and self.voices:
+                    self.underruns_in_tick += 1
                 still = []
                 for samples, pos in self.voices:
                     chunk = samples[pos:pos + frames]
@@ -398,9 +461,10 @@ class Player:
                     and self.stream.active else "DEAD"
             except Exception:
                 active = "DEAD"
-        return ("%s stream=%s cb=%d queued=%d underruns=%d restarts=%d"
-                % (self.mode, active, self.cb_calls, len(self.voices),
-                   self.underruns, self.restarts))
+        return ("%s stream=%s cb=%d queued=%d underruns=%d(%d in tick) "
+                "restarts=%d" % (self.mode, active, self.cb_calls,
+                                 len(self.voices), self.underruns,
+                                 self.underruns_in_tick, self.restarts))
 
     def report(self):
         """What went wrong with the audio, or nothing at all when it was fine."""
@@ -410,15 +474,16 @@ class Player:
                         "reopened" % self.restarts)
         if self.failures:
             bits.append("%d reopen attempt(s) failed" % self.failures)
-        if self.underruns:
-            # Say what this actually is. An underrun means the device ran dry
-            # for a moment and the output stream glitched; it does NOT discard
-            # a queued tick, because a voice only advances its position when
-            # its samples are actually copied out. A handful over a session is
-            # normal and is not the reason a tick went unheard - claiming
-            # otherwise sends you hunting for programs stealing the sound card.
-            bits.append("%d buffer underrun(s) - brief glitches in the output, "
-                        "not lost ticks" % self.underruns)
+        if self.underruns_in_tick:
+            # This one really does cost you the sound, even though the queue
+            # drains cleanly afterwards and the logs look healthy.
+            bits.append("%d underrun(s) landed WHILE a tick was sounding, so "
+                        "that many ticks were clipped or lost outright"
+                        % self.underruns_in_tick)
+        quiet = self.underruns - self.underruns_in_tick
+        if quiet:
+            bits.append("%d underrun(s) hit silence between ticks, harmless"
+                        % quiet)
         if not bits:
             return ""
         return ("audio trouble over %d ticks: %s.\n"
@@ -899,8 +964,8 @@ def fmt(sec):
 
 
 def run_term(inhale, exhale, hold, total, volume, silent, plain,
-             debug=False):
-    player = Player(silent, debug=debug)
+             debug=False, blocksize=None):
+    player = Player(silent, debug=debug, blocksize=blocksize)
     if player.mode == "bell":
         print(f"  \033[91mno audio backend ({player.reason or 'none found'}).\033[0m")
         print("  \033[2mrun: pip install sounddevice     then try again\033[0m")
@@ -961,17 +1026,20 @@ def run_term(inhale, exhale, hold, total, volume, silent, plain,
         print(f"  \033[91m{player.report()}\033[0m")
 
 
-def selftest(volume, debug=False):
-    p = Player(False, debug=debug)
+def selftest(volume, debug=False, blocksize=None):
+    p = Player(False, debug=debug, blocksize=blocksize)
     print(f"\n  backend: \033[1m{p.mode}\033[0m")
     if p.reason:
         print(f"  \033[2m{p.reason}\033[0m")
     if p.mode == "sounddevice":
-        import sounddevice as sd
-        try:
-            print(f"  output device: {sd.query_devices(kind='output')['name']}")
-        except Exception as e:
-            print(f"  couldn't read device: {e}")
+        print(f"  device: {p.host_api()}")
+        print(f"  buffer: {p.blocksize} frames "
+              f"({p.blocksize / SR * 1000:.0f}ms per callback)")
+        if "MME" in p.host_api().upper():
+            print("  \033[93m  MME is the flakiest host API on Windows and "
+                  "underruns readily.\033[0m")
+            print("  \033[2m  WASAPI was preferred but could not be opened at "
+                  "this rate.\033[0m")
     elif p.mode == "bell":
         print("  \033[91m  no real audio backend. you will hear nothing.\033[0m")
         print("  \033[2m  fix: pip install sounddevice\033[0m")
@@ -1013,6 +1081,9 @@ def main():
     p.add_argument("--test", action="store_true", help="check audio, then exit")
     p.add_argument("--debug-audio", action="store_true",
                    help="log every tick and the stream state, to find dropouts")
+    p.add_argument("--blocksize", type=int, default=None, metavar="N",
+                   help="audio buffer in frames (default %d); raise it if "
+                        "ticks glitch" % BLOCKSIZE)
     a = p.parse_args()
 
     if a.inhale <= 0 or a.exhale <= 0:
@@ -1020,7 +1091,7 @@ def main():
     hold = max(0.0, a.hold)
 
     if a.test:
-        return selftest(a.volume, a.debug_audio)
+        return selftest(a.volume, a.debug_audio, a.blocksize)
 
     total = None if a.minutes is None else a.minutes * 60
 
@@ -1032,7 +1103,7 @@ def main():
             sys.exit(f"gui needs tkinter and pillow ({e})\n"
                      f"  pip install pillow\n"
                      f"  linux also: sudo apt install python3-tk")
-        pl = Player(a.silent, debug=a.debug_audio)
+        pl = Player(a.silent, debug=a.debug_audio, blocksize=a.blocksize)
         g = Glass(a.inhale, a.exhale, hold, pl, a.volume, total)
         try:
             g.run()
@@ -1053,7 +1124,7 @@ def main():
     print("\033[2m  nose only. belly moves, chest doesn't. keep it small.\033[0m\n")
     time.sleep(1.5)
     run_term(a.inhale, exhale, hold, total, a.volume, a.silent, plain,
-             a.debug_audio)
+             a.debug_audio, a.blocksize)
 
 
 if __name__ == "__main__":
