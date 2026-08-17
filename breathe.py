@@ -201,7 +201,7 @@ def phase_count(inhale, exhale, phase, left):
 
 # ============================================================ SOUND
 
-def make_tick(freq=660.0, dur=0.30, decay=11.0, volume=0.5):
+def make_tick(freq=660.0, dur=0.30, decay=8.0, volume=0.5):
     """Soft bell-ish tick. Fast attack, exponential decay, no click.
 
     It has to RING, not click. The original was 90ms at -12dBFS peak and
@@ -215,16 +215,23 @@ def make_tick(freq=660.0, dur=0.30, decay=11.0, volume=0.5):
     n = int(SR * dur)
     t = np.arange(n) / SR
 
-    body = (
-        1.00 * np.sin(2 * math.pi * freq * t)
-        + 0.30 * np.sin(2 * math.pi * freq * 2 * t)
-        + 0.12 * np.sin(2 * math.pi * freq * 3 * t)
-    )
-    noise = np.random.default_rng(0).normal(0, 1, n) * np.exp(-t * 900) * 0.15
+    # Each partial gets its OWN decay, and the upper ones die away several
+    # times faster than the fundamental. That is the whole difference between a
+    # bell and a buzzer: sharing one envelope across all three, as this did,
+    # keeps 2f and 3f ringing for the full 300ms and sounds harsh. Now the
+    # brightness is only in the attack and what is left is a soft tone.
+    body = np.zeros(n)
+    for mult, amp, faster in ((1.0, 1.00, 1.0), (2.0, 0.16, 2.8),
+                              (3.0, 0.05, 4.5)):
+        body += amp * np.sin(2 * math.pi * freq * mult * t) \
+            * np.exp(-t * decay * faster)
 
-    env = np.exp(-t * decay)
-    attack = np.minimum(t / 0.0025, 1.0)
-    w = (body + noise) * env * attack
+    # Just enough transient to give it an edge to land on, an eighth of what it
+    # was: at 300ms a prominent knock reads as a cheap click, not a chime.
+    noise = np.random.default_rng(0).normal(0, 1, n) * np.exp(-t * 1400) * 0.05
+
+    # 8ms rather than 2.5ms, so it swells instead of snapping.
+    w = (body + noise) * np.minimum(t / 0.008, 1.0)
 
     # one-pole lowpass, vectorised via lfilter-style accumulation
     a = 0.32
