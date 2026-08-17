@@ -216,6 +216,7 @@ class Player:
         self.reason = ""
         self.tmp = {}
         self.voices = []
+        self.underruns = 0
         self.lock = threading.Lock()
         if silent:
             self.mode = "silent"
@@ -226,9 +227,17 @@ class Player:
             if not any(d["max_output_channels"] > 0 for d in devs):
                 raise RuntimeError("no output device exists")
             self.sd = sd
+            # Deliberately NOT a small buffer or latency="low". The mixing
+            # callback below is Python, so it needs the GIL, and the render
+            # loop holds the GIL for a few ms of every frame. A 256-frame
+            # buffer gives the callback 5.8ms to be scheduled, wake up and
+            # finish - it loses that race often enough to swallow whole ticks.
+            # Let PortAudio pick the buffer and take the device's default
+            # latency: tens of ms is inaudible on a 4-second inhale, and a
+            # tick you actually hear beats a prompt one you don't.
             self.stream = sd.OutputStream(
                 samplerate=SR, channels=1, dtype="float32",
-                blocksize=256, latency="low", callback=self._cb,
+                blocksize=0, callback=self._cb,
             )
             self.stream.start()
             self.mode = "sounddevice"
@@ -247,6 +256,11 @@ class Player:
                 return
 
     def _cb(self, outdata, frames, timeinfo, status):
+        # A dropped tick is silent in every sense, so count the drops: this is
+        # the difference between "the pacer is broken" and "the audio buffer
+        # underran 40 times", which is a thing you can act on.
+        if status and status.output_underflow:
+            self.underruns += 1
         outdata.fill(0)
         with self.lock:
             still = []
@@ -281,6 +295,14 @@ class Player:
         elif self.mode == "bell":
             sys.stdout.write("\a")
             sys.stdout.flush()
+
+    def report(self):
+        """One line about dropped audio, or nothing at all when it was fine."""
+        if self.underruns:
+            return ("audio buffer underran %d times - some ticks were dropped. "
+                    "close what is competing for the sound device, or run with "
+                    "--silent and watch the orb." % self.underruns)
+        return ""
 
     def close(self):
         if self.mode == "sounddevice":
@@ -831,15 +853,21 @@ def selftest(volume):
         print("  \033[2m  fix: pip install sounddevice\033[0m")
         print("  \033[2m  linux also needs: sudo apt install libportaudio2\033[0m")
 
-    print(f"\n  playing 3 ticks at volume {volume:g}...")
-    t = make_tick(volume=volume)
-    for i in range(3):
-        p.play(t, "in")
+    print(f"\n  playing 8 ticks at volume {volume:g} - every one should sound...")
+    t_in = make_tick(740.0, volume=volume)
+    t_out = make_tick(494.0, volume=volume * 0.85)
+    for i in range(8):
+        p.play(t_in if i % 2 == 0 else t_out, "in" if i % 2 == 0 else "out")
         print(f"    tick {i + 1}")
-        time.sleep(1.0)
+        time.sleep(0.7)
     time.sleep(0.4)
     p.close()
-    print("\n  heard nothing? try --volume 0.8, check system volume,")
+    if p.report():
+        print(f"\n  \033[91m{p.report()}\033[0m")
+    else:
+        print("\n  no dropped audio here. If ticks still go missing with --gui,")
+        print("  \033[2mthe render loop is starving the audio callback: say so.\033[0m")
+    print("\n  heard nothing at all? try --volume 0.8, check system volume,")
     print("  and note ssh / WSL / docker have no audio device at all.\n")
 
 
@@ -884,6 +912,8 @@ def main():
             g.run()
         finally:
             pl.close()
+            if pl.report():
+                print("  \033[91m%s\033[0m" % pl.report())
         return
 
     plain = a.interval is not None

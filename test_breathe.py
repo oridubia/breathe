@@ -172,6 +172,74 @@ def test_inhale_and_exhale_ticks_are_distinguishable():
     assert not (breathe.make_tick(740.0) == breathe.make_tick(494.0)).all()
 
 
+class _Status:
+    """Stands in for sounddevice's CallbackFlags."""
+
+    def __init__(self, output_underflow=False):
+        self.output_underflow = output_underflow
+
+
+def _outdata(frames):
+    import numpy
+    return numpy.zeros((frames, 1), dtype=numpy.float32)
+
+
+def test_callback_mixes_a_queued_tick_into_the_output():
+    import numpy
+    p = breathe.Player(silent=True)
+    tick = breathe.make_tick(volume=0.5)
+    p.voices.append((tick, 0))
+    out = _outdata(256)
+    p._cb(out, 256, None, _Status())
+    assert numpy.allclose(out[:, 0], tick[:256])
+
+
+def test_a_tick_outlasting_one_block_survives_to_the_next_callback():
+    import numpy
+    p = breathe.Player(silent=True)
+    tick = breathe.make_tick(volume=0.5)
+    assert len(tick) > 512, "this test needs a tick longer than two blocks"
+    p.voices.append((tick, 0))
+    p._cb(_outdata(256), 256, None, _Status())
+    assert p.voices[0][1] == 256, "playback position did not advance"
+    out = _outdata(256)
+    p._cb(out, 256, None, _Status())
+    assert numpy.allclose(out[:, 0], tick[256:512])
+
+
+def test_two_overlapping_ticks_sum_rather_than_replace():
+    import numpy
+    p = breathe.Player(silent=True)
+    tick = breathe.make_tick(volume=0.4)
+    p.voices.extend([(tick, 0), (tick, 0)])
+    out = _outdata(256)
+    p._cb(out, 256, None, _Status())
+    assert numpy.allclose(out[:, 0], tick[:256] * 2)
+
+
+def test_a_finished_tick_is_dropped_from_the_mix():
+    p = breathe.Player(silent=True)
+    tick = breathe.make_tick(volume=0.5)
+    p.voices.append((tick, 0))
+    p._cb(_outdata(len(tick) + 64), len(tick) + 64, None, _Status())
+    assert p.voices == []
+
+
+def test_the_callback_counts_underruns_and_reports_them():
+    p = breathe.Player(silent=True)
+    assert p.underruns == 0 and p.report() == ""
+    for _ in range(3):
+        p._cb(_outdata(256), 256, None, _Status(output_underflow=True))
+    assert p.underruns == 3
+    assert "3 times" in p.report()
+
+
+def test_a_clean_run_reports_nothing():
+    p = breathe.Player(silent=True)
+    p._cb(_outdata(256), 256, None, _Status())
+    assert p.report() == ""
+
+
 def test_silent_player_stays_quiet():
     player = breathe.Player(silent=True)
     assert player.mode == "silent"
