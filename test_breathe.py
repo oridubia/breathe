@@ -5,6 +5,9 @@ the whole drawing path is exercised here headlessly.
 """
 
 import math
+import os
+import sys
+import wave
 
 import pytest
 
@@ -371,6 +374,83 @@ def _wired_player(sd=None):
     p.sd = sd or _FakeSd()
     p.stream = _FakeStream()
     return p
+
+
+# ------------------------------------------------- the no-callback backend
+# Every failure so far lived inside PortAudio's callback path, including in
+# --test where nothing else was running. winsound has no Python in the
+# playback path at all, so there is nothing there to be late.
+
+class _FakeWinsound:
+    SND_FILENAME = 0x20000
+    SND_ASYNC = 0x0001
+    SND_NODEFAULT = 0x0002
+
+    def __init__(self):
+        self.played = []
+
+    def PlaySound(self, path, flags):
+        self.played.append((path, flags))
+
+
+def test_winsound_is_preferred_on_windows(monkeypatch):
+    monkeypatch.setattr(breathe.platform, "system", lambda: "Windows")
+    monkeypatch.setitem(sys.modules, "winsound", _FakeWinsound())
+    p = breathe.Player()
+    assert p.mode == "winsound"
+
+
+def test_winsound_is_not_used_off_windows(monkeypatch):
+    monkeypatch.setattr(breathe.platform, "system", lambda: "Linux")
+    monkeypatch.setitem(sys.modules, "winsound", _FakeWinsound())
+    p = breathe.Player()
+    assert p.mode != "winsound"
+
+
+def test_the_backend_can_be_forced_past_winsound(monkeypatch):
+    """--backend sounddevice must skip winsound even on Windows, so the two
+    can be compared against each other."""
+    monkeypatch.setattr(breathe.platform, "system", lambda: "Windows")
+    monkeypatch.setitem(sys.modules, "winsound", _FakeWinsound())
+    p = breathe.Player(backend="sounddevice")
+    assert p.mode != "winsound"
+
+
+def test_winsound_plays_asynchronously_and_never_the_default_beep(monkeypatch):
+    fake = _FakeWinsound()
+    monkeypatch.setattr(breathe.platform, "system", lambda: "Windows")
+    monkeypatch.setitem(sys.modules, "winsound", fake)
+    p = breathe.Player()
+    p.play(breathe.make_tick(breathe.TICK_IN_HZ), "in")
+    assert len(fake.played) == 1
+    path, flags = fake.played[0]
+    assert path.endswith("breathe_in.wav")
+    assert flags & fake.SND_ASYNC, "a blocking play would stall the pacer"
+    assert flags & fake.SND_NODEFAULT, "a failure must be silence, not a beep"
+
+
+def test_the_wav_handed_to_windows_round_trips_intact():
+    """winsound plays a file, so the file has to be right."""
+    import numpy
+    p = breathe.Player(silent=True)
+    tick = breathe.make_tick(breathe.TICK_OUT_HZ, volume=0.5)
+    path = p._wav(tick, "out")
+    with wave.open(path, "rb") as w:
+        assert w.getnchannels() == 1
+        assert w.getsampwidth() == 2
+        assert w.getframerate() == breathe.SR
+        assert w.getnframes() == len(tick)
+        pcm = numpy.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
+    assert numpy.allclose(pcm / 32767.0, tick, atol=1e-4)
+
+
+def test_the_wav_is_written_once_and_reused():
+    p = breathe.Player(silent=True)
+    tick = breathe.make_tick()
+    first = p._wav(tick, "in")
+    mtime = os.path.getmtime(first)
+    assert p._wav(tick, "in") == first
+    assert os.path.getmtime(first) == mtime
 
 
 def test_wasapi_is_preferred_over_mme_on_windows(monkeypatch):

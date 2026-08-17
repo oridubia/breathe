@@ -242,8 +242,10 @@ class Player:
     """Persistent output stream so a tick costs ~0ms instead of reopening
     the device every time. Falls back to a system player, then the bell."""
 
-    def __init__(self, silent=False, debug=False, blocksize=None):
+    def __init__(self, silent=False, debug=False, blocksize=None,
+                 backend="auto"):
         self.mode = "bell"
+        self.winsound = None
         self.reason = ""
         self.debug = debug
         self.tmp = {}
@@ -264,27 +266,49 @@ class Player:
         if silent:
             self.mode = "silent"
             return
-        try:
-            import sounddevice as sd
-            if not any(d["max_output_channels"] > 0 for d in sd.query_devices()):
-                raise RuntimeError("no output device exists")
-            self.sd = sd
-            self._preferred = self._pick_device()
-            self._open_stream()
-            self.mode = "sounddevice"
-            return
-        except ImportError:
-            self.reason = "sounddevice not installed"
-        except Exception as e:
-            self.reason = f"sounddevice failed: {e}"
+        want = None if backend == "auto" else backend
 
-        for cmd in (["afplay"], ["paplay"], ["aplay", "-q"]):
-            if shutil.which(cmd[0]):
-                self.cmd = cmd
-                self.mode = "system"
-                if not self.reason:
-                    self.reason = "using system player (higher latency)"
+        # Windows first choice: winsound. Not because it is elegant - it plays
+        # one sound at a time from a file on disk - but because there is no
+        # Python in the playback path at ALL. No mixing callback to be late, no
+        # GIL to lose, no buffer to underrun, no stream to die unnoticed. Every
+        # failure so far has been somewhere inside PortAudio's callback path,
+        # including in --test where nothing else was running, so the way to
+        # stop chasing it is to not use it. Ticks are seconds apart, so the
+        # one-sound-at-a-time limit costs nothing.
+        if want in (None, "winsound") and platform.system() == "Windows":
+            try:
+                import winsound
+                self.winsound = winsound
+                self.mode = "winsound"
                 return
+            except ImportError:
+                self.reason = "winsound unavailable"
+
+        if want in (None, "sounddevice"):
+            try:
+                import sounddevice as sd
+                if not any(d["max_output_channels"] > 0
+                           for d in sd.query_devices()):
+                    raise RuntimeError("no output device exists")
+                self.sd = sd
+                self._preferred = self._pick_device()
+                self._open_stream()
+                self.mode = "sounddevice"
+                return
+            except ImportError:
+                self.reason = "sounddevice not installed"
+            except Exception as e:
+                self.reason = f"sounddevice failed: {e}"
+
+        if want in (None, "system"):
+            for cmd in (["afplay"], ["paplay"], ["aplay", "-q"]):
+                if shutil.which(cmd[0]):
+                    self.cmd = cmd
+                    self.mode = "system"
+                    if not self.reason:
+                        self.reason = "using system player (higher latency)"
+                    return
 
     def _pick_device(self):
         """Prefer WASAPI on Windows.
@@ -444,6 +468,14 @@ class Player:
                     self.reason = f"stream restart failed: {e}"
             with self.lock:
                 self.voices.append((samples, 0))
+        elif self.mode == "winsound":
+            # SND_ASYNC hands it to the OS mixer and returns immediately.
+            # SND_NODEFAULT so a failure is silence rather than the Windows
+            # default beep, which would be worse than a missed tick.
+            self.winsound.PlaySound(
+                self._wav(samples, key),
+                self.winsound.SND_FILENAME | self.winsound.SND_ASYNC
+                | self.winsound.SND_NODEFAULT)
         elif self.mode == "system":
             subprocess.Popen(self.cmd + [self._wav(samples, key)],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -964,8 +996,9 @@ def fmt(sec):
 
 
 def run_term(inhale, exhale, hold, total, volume, silent, plain,
-             debug=False, blocksize=None):
-    player = Player(silent, debug=debug, blocksize=blocksize)
+             debug=False, blocksize=None, backend="auto"):
+    player = Player(silent, debug=debug, blocksize=blocksize,
+                    backend=backend)
     if player.mode == "bell":
         print(f"  \033[91mno audio backend ({player.reason or 'none found'}).\033[0m")
         print("  \033[2mrun: pip install sounddevice     then try again\033[0m")
@@ -1026,11 +1059,15 @@ def run_term(inhale, exhale, hold, total, volume, silent, plain,
         print(f"  \033[91m{player.report()}\033[0m")
 
 
-def selftest(volume, debug=False, blocksize=None):
-    p = Player(False, debug=debug, blocksize=blocksize)
+def selftest(volume, debug=False, blocksize=None, backend="auto"):
+    p = Player(False, debug=debug, blocksize=blocksize, backend=backend)
     print(f"\n  backend: \033[1m{p.mode}\033[0m")
     if p.reason:
         print(f"  \033[2m{p.reason}\033[0m")
+    if p.mode == "winsound":
+        print("  \033[2m  native Win32 playback - no callback, nothing to "
+              "underrun.\033[0m")
+        print("  \033[2m  compare with: --backend sounddevice\033[0m")
     if p.mode == "sounddevice":
         print(f"  device: {p.host_api()}")
         print(f"  buffer: {p.blocksize} frames "
@@ -1081,6 +1118,11 @@ def main():
     p.add_argument("--test", action="store_true", help="check audio, then exit")
     p.add_argument("--debug-audio", action="store_true",
                    help="log every tick and the stream state, to find dropouts")
+    p.add_argument("--backend", default="auto",
+                   choices=("auto", "winsound", "sounddevice", "system",
+                            "bell"),
+                   help="force an audio backend; auto prefers winsound on "
+                        "Windows, which has no callback to miss a tick")
     p.add_argument("--blocksize", type=int, default=None, metavar="N",
                    help="audio buffer in frames (default %d); raise it if "
                         "ticks glitch" % BLOCKSIZE)
@@ -1091,7 +1133,7 @@ def main():
     hold = max(0.0, a.hold)
 
     if a.test:
-        return selftest(a.volume, a.debug_audio, a.blocksize)
+        return selftest(a.volume, a.debug_audio, a.blocksize, a.backend)
 
     total = None if a.minutes is None else a.minutes * 60
 
@@ -1103,7 +1145,8 @@ def main():
             sys.exit(f"gui needs tkinter and pillow ({e})\n"
                      f"  pip install pillow\n"
                      f"  linux also: sudo apt install python3-tk")
-        pl = Player(a.silent, debug=a.debug_audio, blocksize=a.blocksize)
+        pl = Player(a.silent, debug=a.debug_audio, blocksize=a.blocksize,
+                    backend=a.backend)
         g = Glass(a.inhale, a.exhale, hold, pl, a.volume, total)
         try:
             g.run()
@@ -1124,7 +1167,7 @@ def main():
     print("\033[2m  nose only. belly moves, chest doesn't. keep it small.\033[0m\n")
     time.sleep(1.5)
     run_term(a.inhale, exhale, hold, total, a.volume, a.silent, plain,
-             a.debug_audio, a.blocksize)
+             a.debug_audio, a.blocksize, a.backend)
 
 
 if __name__ == "__main__":
