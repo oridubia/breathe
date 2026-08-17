@@ -151,6 +151,34 @@ def test_count_walks_the_whole_phase_without_skipping_a_number():
 
 # ------------------------------------------------------------------ the sound
 
+def test_the_tick_rings_rather_than_clicks():
+    """The defect behind "it randomly misses ticks".
+
+    The original tick stayed within 25dB of its own peak for 78ms at -24dBFS
+    RMS - near the threshold of noticing, so whether you caught it depended on
+    the room and your attention rather than on whether it played. Nothing about
+    that is visible in a log: every tick was dispatched, mixed and drained
+    correctly. It has to ring long enough to be unmissable.
+    """
+    import numpy
+    x = breathe.make_tick(breathe.TICK_IN_HZ)
+    peak = float(numpy.abs(x).max())
+    above = numpy.where(numpy.abs(x) > peak * 10 ** (-25 / 20.0))[0]
+    audible_ms = (above[-1] - above[0]) / breathe.SR * 1000
+    assert audible_ms > 150, "only %.0fms of audible ring" % audible_ms
+
+    rms = float(numpy.sqrt(numpy.mean(x.astype(numpy.float64) ** 2)))
+    assert 20 * math.log10(rms) > -21, "too quiet at %.1f dBFS RMS" % (
+        20 * math.log10(rms))
+
+
+def test_a_tick_still_fits_between_two_ticks():
+    """It may ring, but never over the top of the next one."""
+    longest = len(breathe.make_tick(breathe.TICK_IN_HZ)) / breathe.SR
+    tightest_gap = min(4.0, 6.0) / 2       # shortest half-breath worth pacing
+    assert longest < tightest_gap
+
+
 def test_tick_is_the_requested_length_and_volume():
     tick = breathe.make_tick(740.0, dur=0.09, volume=0.4)
     assert len(tick) == int(breathe.SR * 0.09)

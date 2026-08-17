@@ -29,6 +29,8 @@ ARCHITECTURE INVARIANTS - do not break these:
 
 2. AUDIO. Ticks are synthesised with numpy (fundamental + two quiet partials,
    short noise transient, exponential decay, one-pole lowpass, fade in/out).
+   They must RING for ~250ms, not click: a 78ms blip reads as "it randomly
+   misses ticks" because catching it depends on the room, not on the code.
    Playback is one persistent sounddevice.OutputStream with a mixing callback
    - reopening the device per tick adds jitter. Fallback chain: stream ->
    system player -> terminal bell.
@@ -195,8 +197,17 @@ def phase_count(inhale, exhale, phase, left):
 
 # ============================================================ SOUND
 
-def make_tick(freq=660.0, dur=0.09, volume=0.25):
-    """Soft woodblock-ish tick. Fast attack, exponential decay, no click."""
+def make_tick(freq=660.0, dur=0.30, decay=11.0, volume=0.5):
+    """Soft bell-ish tick. Fast attack, exponential decay, no click.
+
+    It has to RING, not click. The original was 90ms at -12dBFS peak and
+    -24dBFS RMS, which stays within 25dB of its own peak for only 78ms - a
+    near-threshold blip. Near-threshold is precisely what gets perceived as
+    "it randomly misses ticks": whether you catch it depends on the room and
+    where your attention is, not on whether it played. At 300ms and half
+    scale it is 264ms of audible ring and 6dB louder, while staying soft
+    enough for something you sit with.
+    """
     n = int(SR * dur)
     t = np.arange(n) / SR
 
@@ -207,7 +218,7 @@ def make_tick(freq=660.0, dur=0.09, volume=0.25):
     )
     noise = np.random.default_rng(0).normal(0, 1, n) * np.exp(-t * 900) * 0.15
 
-    env = np.exp(-t * 38.0)
+    env = np.exp(-t * decay)
     attack = np.minimum(t / 0.0025, 1.0)
     w = (body + noise) * env * attack
 
@@ -400,7 +411,14 @@ class Player:
         if self.failures:
             bits.append("%d reopen attempt(s) failed" % self.failures)
         if self.underruns:
-            bits.append("%d buffer underrun(s)" % self.underruns)
+            # Say what this actually is. An underrun means the device ran dry
+            # for a moment and the output stream glitched; it does NOT discard
+            # a queued tick, because a voice only advances its position when
+            # its samples are actually copied out. A handful over a session is
+            # normal and is not the reason a tick went unheard - claiming
+            # otherwise sends you hunting for programs stealing the sound card.
+            bits.append("%d buffer underrun(s) - brief glitches in the output, "
+                        "not lost ticks" % self.underruns)
         if not bits:
             return ""
         return ("audio trouble over %d ticks: %s.\n"
@@ -990,7 +1008,7 @@ def main():
                    help="plain metronome: one tick every N seconds (terminal only)")
     p.add_argument("--minutes", type=float, default=None,
                    help="stop after N minutes (default: forever)")
-    p.add_argument("--volume", type=float, default=0.25)
+    p.add_argument("--volume", type=float, default=0.5)
     p.add_argument("--silent", action="store_true")
     p.add_argument("--test", action="store_true", help="check audio, then exit")
     p.add_argument("--debug-audio", action="store_true",
