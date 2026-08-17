@@ -7,6 +7,7 @@ the whole drawing path is exercised here headlessly.
 import math
 import os
 import sys
+import time
 import wave
 
 import pytest
@@ -334,10 +335,12 @@ def test_a_clean_run_reports_nothing():
 # audio device to be yanked away and cannot be reproduced in a test.
 
 class _FakeStream:
-    def __init__(self, active=True):
+    def __init__(self, active=True, callback=None, deaf=False):
         self._active = active
         self.started = False
         self.closed = False
+        self._callback = callback
+        self.deaf = deaf               # opens and reports active, never calls back
 
     @property
     def active(self):
@@ -345,21 +348,25 @@ class _FakeStream:
 
     def start(self):
         self.started = True
+        if self._callback is not None and not self.deaf:
+            self._callback(_outdata(256), 256, None, _Status())
 
     def close(self, ignore_errors=False):
         self.closed = True
 
 
 class _FakeSd:
-    def __init__(self, refuse=()):
+    def __init__(self, refuse=(), deaf=()):
         self.opened = []
         self.refuse = refuse           # device ids that cannot be opened
+        self.deaf = deaf               # device ids that open but never call back
 
     def OutputStream(self, **kw):
         self.opened.append(kw)
-        if kw.get("device") in self.refuse:
-            raise RuntimeError("device %r refused this rate" % kw.get("device"))
-        return _FakeStream()
+        dev = kw.get("device")
+        if dev in self.refuse:
+            raise RuntimeError("device %r refused this rate" % dev)
+        return _FakeStream(callback=kw.get("callback"), deaf=dev in self.deaf)
 
     def query_hostapis(self, index=None):
         apis = [{"name": "MME", "default_output_device": 0},
@@ -464,6 +471,81 @@ def test_the_host_api_is_left_to_portaudio_off_windows(monkeypatch):
     monkeypatch.setattr(breathe.platform, "system", lambda: "Linux")
     p = _wired_player()
     assert p._pick_device() is None
+
+
+def test_a_stream_that_opens_but_never_calls_back_is_rejected():
+    """The "I only heard one tick" failure.
+
+    A stream can start, report active, and never invoke its callback - WASAPI
+    does this when the endpoint disagrees about the format. The device pre-rolls
+    so the first tick sounds, and then nothing ever does again while every
+    counter insists the stream is healthy. Opening is not working, so it has to
+    be proven before the device is accepted.
+    """
+    p = _wired_player(sd=_FakeSd(deaf=(4,)))
+    p._preferred = 4
+    p.stream = None
+    p._open_stream()
+    assert [kw["device"] for kw in p.sd.opened] == [4, None]
+    assert p.device is None, "fell back to the working device"
+
+
+def test_every_candidate_being_deaf_raises_rather_than_pretending():
+    p = _wired_player(sd=_FakeSd(deaf=(4, None)))
+    p._preferred = 4
+    p.stream = None
+    with pytest.raises(Exception, match="no callbacks"):
+        p._open_stream()
+
+
+def test_a_rejected_stream_is_closed_not_leaked():
+    p = _wired_player(sd=_FakeSd(deaf=(4,)))
+    p._preferred = 4
+    p.stream = None
+    p._open_stream()
+    assert p.stream is not None and not p.stream.closed
+
+
+def test_callbacks_flowing_gives_up_rather_than_hanging():
+    p = breathe.Player(silent=True)
+    t0 = time.monotonic()
+    assert p._callbacks_flowing(p.cb_calls, timeout=0.05) is False
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_callbacks_flowing_counts_one_that_fired_during_startup():
+    """Sampled after start(), a stream that called back immediately would look
+    like a dud and be rejected."""
+    p = breathe.Player(silent=True)
+    before = p.cb_calls
+    p._cb(_outdata(256), 256, None, _Status())      # fires during startup
+    assert p._callbacks_flowing(before, timeout=0.05) is True
+
+
+def test_reopening_discards_ticks_the_dead_stream_never_played():
+    """The "I heard one tick, the last of the eight" failure.
+
+    Every reopen used to keep the undrained queue, so ticks piled up while
+    reopens failed and then one working stream played all of them at once -
+    each from the start of the buffer, so they summed into a single clipped
+    blast. A stale pacing cue is worse than none.
+    """
+    p = _wired_player()
+    for _ in range(8):
+        p.voices.append((breathe.make_tick(), 0))
+    p._open_stream()
+    assert p.voices == [], "stale ticks survived the reopen"
+
+
+def test_the_mix_is_clipped_so_a_pile_up_cannot_crack():
+    import numpy
+    p = breathe.Player(silent=True)
+    tick = breathe.make_tick(volume=0.5)
+    for _ in range(8):                              # 8 x 0.5 would be 4.0
+        p.voices.append((tick, 0))
+    out = _outdata(1024)
+    p._cb(out, 1024, None, _Status())
+    assert float(numpy.abs(out).max()) <= 1.0
 
 
 def test_the_default_device_is_the_fallback_when_wasapi_refuses():

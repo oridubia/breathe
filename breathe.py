@@ -348,6 +348,16 @@ class Player:
                 pass
             self.stream = None
 
+        # Drop anything queued for the stream we just abandoned. It never
+        # drained, it is seconds stale, and a pacing cue that arrives late is
+        # worse than one that never arrives. Keeping them caused the ugliest
+        # symptom of all: every tick piling up undrained while reopens failed,
+        # then one reopen finally working and playing all eight at once - each
+        # from outdata[0], so they summed into a single clipped blast. That
+        # reads as "I heard one tick, the last of the eight".
+        with self.lock:
+            self.voices = []
+
         # WASAPI can refuse a rate the endpoint is not configured for, so the
         # default device stays as the fallback rather than the only option.
         candidates = [self._preferred, None] if self._preferred is not None \
@@ -359,13 +369,40 @@ class Player:
                     samplerate=SR, channels=1, dtype="float32",
                     blocksize=self.blocksize, device=device, callback=self._cb,
                 )
+                # Count from BEFORE the start, or a callback that fires during
+                # startup is missed and a working stream looks like a dud.
+                before = self.cb_calls
                 self.stream.start()
+                # Opening is not working. A stream can start, report active and
+                # never call back - WASAPI does exactly this when the endpoint
+                # disagrees about the format, and MME can too. The symptom is
+                # brutal and misleading: the first tick sounds because the
+                # device pre-rolls, then nothing ever does again, while every
+                # counter says the stream is fine. So prove it before trusting
+                # it, and fall through to the next device if it is a dud.
+                if not self._callbacks_flowing(before):
+                    raise RuntimeError(
+                        "stream started but produced no callbacks")
                 self.device = device
                 return
             except Exception as e:
                 last = e
+                if self.stream is not None:
+                    try:
+                        self.stream.close(ignore_errors=True)
+                    except Exception:
+                        pass
                 self.stream = None
         raise last
+
+    def _callbacks_flowing(self, seen, timeout=0.4):
+        """Wait briefly for the callback to fire past the given count."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.cb_calls > seen:
+                return True
+            time.sleep(0.01)
+        return False
 
     def host_api(self):
         """Which host API we actually landed on - MME vs WASAPI matters."""
@@ -426,6 +463,10 @@ class Player:
                         if pos + frames < len(samples):
                             still.append((samples, pos + frames))
                 self.voices = still
+            # Voices sum, and every one of them writes from the start of the
+            # buffer, so any coincidence can exceed full scale. Clip rather
+            # than let it wrap into a horrible crack.
+            np.clip(outdata, -1.0, 1.0, out=outdata)
         except Exception:
             # PortAudio ABORTS the stream permanently if an exception escapes
             # a callback - one bad frame would mean silence until restart,
