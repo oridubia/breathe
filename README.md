@@ -31,6 +31,12 @@ python3 breathe.py --help                        # all options
 
 GUI keys: drag to move, space to pause, Esc to quit.
 
+## iOS app
+
+`ios/` holds the same pacer as an iPhone and iPad app: the same clock, ticks
+and orb, with the ticks continuing when the screen is locked. See
+[ios/README.md](ios/README.md).
+
 ## Tests
 
 ```sh
