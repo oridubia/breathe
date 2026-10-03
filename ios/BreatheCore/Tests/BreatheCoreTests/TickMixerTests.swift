@@ -146,6 +146,33 @@ struct TickMixerTests {
         #expect(mixer.ticksStarted == 3)
     }
 
+    @Test("Pausing where the audio has rendered to plays the next tick once, after the resume")
+    func pausingAtTheRenderedPointPlaysTheNextTickOnceAfterResuming() {
+        let mixer = TickMixer(sampleRate: sampleRate, current: .silent)
+        var timeline = session()
+        // 10 ms buffers, rendered up to elapsed 4.49: one buffer short of the
+        // exhale at 4.5. The app pauses the clock there, where the sound it
+        // has committed to stops, rather than at the earlier tap.
+        let frames = 480
+        _ = render(mixer, timeline, heardFrom: start - 0.01, seconds: 4.5, frames: frames)
+        #expect(mixer.ticksStarted == 1)
+        timeline.clock.pause(at: start + 4.49)
+        let paused = render(mixer, timeline, heardFrom: start + 4.49, seconds: 1, frames: frames)
+        #expect(mixer.ticksStarted == 1)
+        #expect(paused.allSatisfy { $0 == 0 })
+
+        // The exhale lands on the first frame of the second resumed buffer:
+        // elapsed 4.49 to 4.5, neither skipped nor repeated.
+        timeline.clock.resume(at: start + 20)
+        let resumed = render(mixer, timeline, heardFrom: start + 20, seconds: 1, frames: frames)
+        #expect(mixer.ticksStarted == 2)
+        #expect(resumed[..<frames].allSatisfy { $0 == 0 })
+        #expect(zip(resumed[frames...], tick(.exhale)).allSatisfy { abs($0 - $1 * 0.5) < 1e-7 })
+        // Nothing more until the inhale at elapsed 11 (host 36.51).
+        _ = render(mixer, timeline, heardFrom: start + 21, seconds: 5, frames: frames)
+        #expect(mixer.ticksStarted == 2)
+    }
+
     @Test func noTickAtOrAfterTheLimit() {
         let mixer = TickMixer(sampleRate: sampleRate, current: .silent)
         _ = render(mixer, session(limit: 11), heardFrom: start - 0.1, seconds: 12)

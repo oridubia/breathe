@@ -143,6 +143,17 @@ struct ReadingTests {
         #expect(standard.cyclesCompleted(after: 11.01) == 1)
         #expect(standard.cyclesCompleted(after: 600) == 54)
     }
+
+    @Test("A session that is a whole number of cycles long does not count the inhale due at its end")
+    func cyclesCompletedLeavesOutAnInhaleDueExactlyAtTheEnd() throws {
+        // breathe.py's loop stops before it would see that inhale, and the
+        // mixer plays no tick at the limit: ten minutes of 5 in / 5 out is 59.
+        let pattern = try #require(BreathPattern(inhale: 5, exhale: 5, hold: 0))
+        #expect(pattern.cyclesCompleted(after: 600) == 59)
+        #expect(pattern.cyclesCompleted(after: 600.01) == 60)
+        #expect(pattern.cyclesCompleted(after: 10) == 0)
+        #expect(pattern.cyclesCompleted(after: 0.01) == 0)
+    }
 }
 
 @Suite("The session clock")

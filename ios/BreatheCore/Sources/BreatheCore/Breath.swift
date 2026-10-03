@@ -57,7 +57,13 @@ extension BreathPattern {
 
     /// Full cycles completed after `elapsed` seconds: the "54 cycles" in
     /// breathe.py's closing line.
+    ///
+    /// A cycle is complete when the next inhale tick sounds, so this counts the
+    /// inhale onsets strictly between 0 and `elapsed`, as breathe.py's loop
+    /// does: it stops before it would see an inhale due exactly at the end of
+    /// the session, and the mixer plays no tick at the limit either. Ten
+    /// minutes of 5 s in, 5 s out is therefore 59 cycles, not 60.
     public func cyclesCompleted(after elapsed: Double) -> Int {
-        elapsed > 0 ? Int((elapsed / period).rounded(.down)) : 0
+        elapsed > 0 ? Int((elapsed / period).rounded(.up)) - 1 : 0
     }
 }
