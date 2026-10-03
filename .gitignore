@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Xcode and SwiftPM
+xcuserdata/
+DerivedData/
+.build/
+.swiftpm/
+build/
+*.ipa
