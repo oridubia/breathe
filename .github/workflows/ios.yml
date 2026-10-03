@@ -67,7 +67,7 @@ jobs:
           mkdir -p build/ipa/Payload
           cp -R build/device/Build/Products/Release-iphoneos/Breathe.app build/ipa/Payload/
           cd build/ipa && zip -qry ../Breathe-unsigned.ipa Payload
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: Breathe-unsigned-ipa
           path: build/Breathe-unsigned.ipa
