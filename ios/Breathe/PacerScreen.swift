@@ -8,6 +8,11 @@ import UIKit
 struct PacerScreen: View {
     @Environment(PacerModel.self) private var pacer
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    /// Room under the orb for the paused buttons, or the summary and the hint,
+    /// at the default text size; it grows with the text. Held in every state,
+    /// so the orb stays put as the session starts, pauses and ends.
+    @ScaledMetric(relativeTo: .headline) private var panelHeight = 80.0
     @State private var showingSettings = false
     private var settings = StoredSettings()
 
@@ -17,23 +22,26 @@ struct PacerScreen: View {
                 .ignoresSafeArea()
             TimelineView(.animation(paused: pacer.status != .running)) { timeline in
                 let frame = pacer.frame(at: Self.hostTime(of: timeline.date), stillHalo: reduceMotion)
-                ZStack {
+                VStack {
+                    topBar(frame)
+                        .padding(.horizontal)
+                    // The orb takes what the bars leave, full width; the painter
+                    // fits the design box into it, so nothing draws over the tab.
                     OrbCanvas(orb: frame.orb, label: frame.label)
-                        .ignoresSafeArea()
                         .accessibilityElement()
                         .accessibilityLabel("Breathing pacer")
                         .accessibilityValue(accessibilityValue(frame))
                         .accessibilityHint(accessibilityHint)
                         .accessibilityAddTraits(.isButton)
                         .accessibilityAction { primaryAction() }
-                    VStack {
-                        topBar(frame)
-                        Spacer()
-                        bottomPanel
-                    }
-                    .padding()
+                    bottomPanel
+                        .frame(minHeight: panelHeight)
+                        .padding(.horizontal)
                 }
-                .sensoryFeedback(trigger: frame.hapticBeat) { old, new in
+                .padding(.vertical)
+                // No frames are drawn with the screen off, so the trigger is nil
+                // across the gap and the first beat back is never the next one.
+                .sensoryFeedback(trigger: scenePhase == .active ? frame.hapticBeat : nil) { old, new in
                     Self.feedback(from: old, to: new)
                 }
             }
@@ -59,17 +67,24 @@ struct PacerScreen: View {
             HStack {
                 Spacer()
                 if pacer.status == .idle {
-                    Button {
-                        showingSettings = true
-                    } label: {
-                        Image(systemName: "slider.horizontal.3")
-                            .font(.title3)
-                            .padding(8)
-                    }
-                    .accessibilityLabel("Settings")
+                    settingsButton
+                } else {
+                    // Laid out unseen, so the bar and the orb below keep their place.
+                    settingsButton.hidden()
                 }
             }
         }
+    }
+
+    private var settingsButton: some View {
+        Button {
+            showingSettings = true
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+                .font(.title3)
+                .padding(8)
+        }
+        .accessibilityLabel("Settings")
     }
 
     private var bottomPanel: some View {
@@ -176,8 +191,10 @@ struct PacerScreen: View {
     }
 
     /// One tap per tick: firmer on the inhale, lighter on the exhale. Only for
-    /// the very next tick, so nothing buzzes when haptics come on mid-breath
-    /// or when the app comes back from the background several ticks later.
+    /// the very next tick, so nothing buzzes when haptics come on mid-breath.
+    /// The body passes a nil trigger while the scene is not active, so coming
+    /// back from the background is never the next tick either, even when
+    /// exactly one beat passed with the screen off.
     private static func feedback(from old: Int?, to new: Int?) -> SensoryFeedback? {
         guard let old, let new, new == old + 1 else { return nil }
         return new.isMultiple(of: 2)

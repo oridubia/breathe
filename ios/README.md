@@ -102,4 +102,10 @@ These are breathe.py's invariants, translated to iOS. Do not break them.
    clock.
 5. **Haptics** come from the frame loop, keyed on `PacerReading.beat`, which
    changes exactly at the onsets. They fire only for the next beat in
-   sequence, so nothing buzzes on returning from the background.
+   sequence and only while the scene is active, so nothing buzzes on
+   returning from the background, and none lands at a session's limit,
+   where no tick plays.
+6. **Pausing** freezes the clock where the audio has already rendered to
+   (now plus the output's look-ahead), and resuming picks it up when the
+   first new sound is heard, so no tick plays during a pause and none is
+   skipped or repeated after it.
