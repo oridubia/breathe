@@ -27,6 +27,8 @@ final class TickEngine {
     private var timeline = AudioTimeline.silent
     /// True from `start()` until `stopAfterTail()`: a session or preview wants sound.
     private var wantsSound = false
+    /// True while the audio session is ours to hand back.
+    private var sessionActive = false
     private var idleStop: Task<Void, Never>?
     private var sessionObservers: [NSObjectProtocol] = []
     private var configurationObserver: NSObjectProtocol?
@@ -61,6 +63,15 @@ final class TickEngine {
         AVAudioSession.sharedInstance().outputLatency
     }
 
+    /// Seconds of sound the audio thread has already committed to at this
+    /// instant: the IO buffer it is filling, then the output latency before
+    /// that buffer is heard. Zero while the engine is not running.
+    var lookAhead: Double {
+        guard engine.isRunning else { return 0 }
+        let session = AVAudioSession.sharedInstance()
+        return session.ioBufferDuration + session.outputLatency
+    }
+
     /// Activates the audio session and starts the engine, if not already running.
     func start() throws {
         idleStop?.cancel()
@@ -72,9 +83,12 @@ final class TickEngine {
             // instead of stopping it, as they would on a desktop.
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try session.setActive(true)
-            if source == nil {
-                try attachSource()
-            }
+            sessionActive = true
+            // A stopped engine's source may hold a tick frozen mid-ring,
+            // which would play out on starting. A fresh one, told what is
+            // already under way, replays nothing.
+            detachSource()
+            try attachSource()
             engine.prepare()
             try engine.start()
         }
@@ -106,6 +120,9 @@ final class TickEngine {
     private func shutDown() {
         guard !wantsSound else { return }
         engine.stop()
+        // Nothing to hand back when no start activated the session.
+        guard sessionActive else { return }
+        sessionActive = false
         do {
             try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         } catch {
@@ -128,6 +145,12 @@ final class TickEngine {
         engine.connect(node, to: engine.mainMixerNode, format: format)
         source = node
         log.info("Tick source attached at \(sampleRate, privacy: .public) Hz")
+    }
+
+    private func detachSource() {
+        guard let source else { return }
+        engine.detach(source)
+        self.source = nil
     }
 
     nonisolated private static func renderBlock(for context: RenderContext) -> AVAudioSourceNodeRenderBlock {
@@ -155,16 +178,14 @@ final class TickEngine {
     /// on if sound is still wanted; the mixer it gets is told what is already
     /// under way, so nothing is replayed.
     private func configurationChanged() {
-        if let source {
-            engine.detach(source)
-            self.source = nil
-        }
+        detachSource()
         restartIfWanted(after: "an audio configuration change")
     }
 
     /// The audio daemon restarted: every audio object is dead. Start over.
     private func mediaServicesReset() {
         source = nil
+        sessionActive = false
         engine = AVAudioEngine()
         observeConfiguration()
         restartIfWanted(after: "a media services reset")

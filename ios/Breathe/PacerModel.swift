@@ -70,6 +70,11 @@ final class PacerModel {
                 soundIssue = Self.describe(error)
             }
         }
+        if !soundOn {
+            // A preview under way would have handed the engine back when it
+            // ended; cancelled, it no longer will, and nothing else wants it.
+            ticks.stopAfterTail()
+        }
         sessionCount += 1
         let session = Session(
             id: sessionCount,
@@ -91,7 +96,11 @@ final class PacerModel {
 
     func pause() {
         guard status == .running, var session else { return }
-        session.clock.pause(at: CACurrentMediaTime())
+        // The audio thread renders a little ahead of now, so a tick due in
+        // that stretch rings out anyway. Freeze the clock where the sound
+        // stops, and the pause screen and the resume agree with what was heard.
+        let frozenAt = CACurrentMediaTime() + (soundOn ? ticks.lookAhead : 0)
+        session.clock.pause(at: frozenAt)
         self.session = session
         status = .paused
         sessionEnd?.cancel()
@@ -110,12 +119,17 @@ final class PacerModel {
             // The engine was stopped when the session paused.
             do {
                 try ticks.start()
+                soundIssue = nil
             } catch {
-                soundOn = false
+                // Still a sounding session: the next resume tries again, once
+                // whatever has the output (a call, say) has let go of it.
                 soundIssue = Self.describe(error)
             }
         }
-        session.clock.resume(at: CACurrentMediaTime())
+        // The first new buffer is heard a look-ahead after now. Pick the
+        // session up where it froze at that moment, so the screen holds
+        // still for that instant and no tick due in it is skipped.
+        session.clock.resume(at: CACurrentMediaTime() + (soundOn ? ticks.lookAhead : 0))
         self.session = session
         status = .running
         timeline.clock = session.clock
@@ -137,6 +151,7 @@ final class PacerModel {
             try ticks.start()
         } catch {
             soundIssue = Self.describe(error)
+            ticks.stopAfterTail()
             return
         }
         timeline.gain = Float(volume)
@@ -165,9 +180,12 @@ final class PacerModel {
             )
         }
         var elapsed = session.clock.elapsed(at: now)
-        if let limit = session.limit {
-            // Until the end-of-session task gets its turn.
-            elapsed = min(elapsed, limit)
+        var atLimit = false
+        if let limit = session.limit, elapsed >= limit {
+            // Until the end-of-session task gets its turn. No tick sounds at
+            // or past the limit, so no haptic lands there either.
+            elapsed = limit
+            atLimit = true
         }
         let reading = session.pattern.reading(at: elapsed)
         let shown = max(0, elapsed)
@@ -177,7 +195,7 @@ final class PacerModel {
             reading: reading,
             elapsed: shown,
             remaining: session.limit.map { max(0, $0 - shown) },
-            hapticBeat: session.haptics && !session.clock.isPaused ? reading.beat : nil
+            hapticBeat: session.haptics && !session.clock.isPaused && !atLimit ? reading.beat : nil
         )
     }
 
@@ -210,14 +228,16 @@ final class PacerModel {
     }
 
     /// Ends the session on time even with the screen locked: the audio keeps
-    /// the app running, and this does not depend on frames being drawn.
+    /// the app running, and this does not depend on frames being drawn. It
+    /// sleeps on the suspending clock, which stands still while the device
+    /// sleeps just as the session clock does.
     private func scheduleEnd() {
         sessionEnd?.cancel()
         guard let session, let limit = session.limit else { return }
         let remaining = limit - session.clock.elapsed(at: CACurrentMediaTime())
         sessionEnd = Task { [weak self] in
             do {
-                try await Task.sleep(for: .seconds(max(0, remaining)))
+                try await Task.sleep(for: .seconds(max(0, remaining)), clock: .suspending)
             } catch {
                 return
             }
